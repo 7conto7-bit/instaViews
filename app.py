@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 import requests
-from flask import Flask, request, render_template_string, jsonify, Response
+from flask import Flask, request, render_template_string, jsonify, Response, redirect, url_for
 
 app = Flask(__name__)
 
@@ -18,19 +18,22 @@ BRT = timezone(timedelta(hours=-3))
 GRAPH_API_VERSION = "v21.0"
 
 # ==============================================================================
-# ARQUIVO .JSON LOCAL (IGUAL AO PRIMEIRO PAINEL)
+# ARQUIVOS .JSON (PERSISTÊNCIA DUPLA: PASTA DO PROJETO + /TMP NA VERCEL)
 # ==============================================================================
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+BUNDLED_MONITOR_FILE = os.path.join(BASE_DIR, "contas_monitoradas.json")
+CODIGO1_ACCOUNTS_FILE = os.path.join(BASE_DIR, "contas_conectadas.json")
 
-# Se estiver rodando na Vercel (onde a pasta raiz é somente leitura), usa /tmp.
-# Caso contrário, salva na mesma pasta do script como no primeiro painel.
 if os.environ.get("VERCEL") or not os.access(BASE_DIR, os.W_OK):
-    ACCOUNTS_FILE = os.path.join("/tmp", "contas_monitoradas.json")
+    RUNTIME_ACCOUNTS_FILE = os.path.join("/tmp", "contas_monitoradas.json")
 else:
-    ACCOUNTS_FILE = os.path.join(BASE_DIR, "contas_monitoradas.json")
+    RUNTIME_ACCOUNTS_FILE = BUNDLED_MONITOR_FILE
 
 ACCOUNTS_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
+
+# Cache em memória do processo para nunca perder dados entre requisições
+MEMORY_CACHE_ACCOUNTS = {}
 
 
 def format_number_br(val):
@@ -57,66 +60,216 @@ def load_json(filepath, default):
 
 
 def save_json(filepath, data):
-    """Sobrescreve o arquivo .json de forma atômica, guardando apenas o estado mais recente."""
+    """Sobrescreve o arquivo .json de forma atômica."""
     tmp_path = f"{filepath}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         os.replace(tmp_path, filepath)
     except Exception:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def sort_accounts_by_views_desc(accounts_dict):
+    """
+    Ordena as contas colocando as com MAIS visualizações totais no topo
+    e as com MENOS visualizações para baixo.
+    """
+    if not isinstance(accounts_dict, dict):
+        return {}
+    sorted_items = sorted(
+        accounts_dict.items(),
+        key=lambda item: (
+            int((item[1] or {}).get("total_views") or 0),
+            int((item[1] or {}).get("followers_count") or 0)
+        ),
+        reverse=True
+    )
+    return dict(sorted_items)
+
+
+def merge_best_account_data(base_acc, new_acc):
+    """
+    Combina duas versões dos dados de uma mesma conta garantindo que NUNCA
+    se percam seguidores, visualizações ou lista de posts caso uma fonte esteja zerada.
+    """
+    if not isinstance(base_acc, dict):
+        base_acc = {}
+    if not isinstance(new_acc, dict):
+        new_acc = {}
+
+    merged = dict(base_acc)
+    for k, v in new_acc.items():
+        if v is not None and v != "":
+            merged[k] = v
+
+    # Garante que seguidores, views e media_count nunca sejam sobrescritos por 0 se já havia valor > 0
+    old_followers = int(base_acc.get("followers_count") or 0)
+    new_followers = int(new_acc.get("followers_count") or 0)
+    merged["followers_count"] = new_followers if new_followers > 0 else old_followers
+
+    old_views = int(base_acc.get("total_views") or 0)
+    new_views = int(new_acc.get("total_views") or 0)
+    merged["total_views"] = max(old_views, new_views)
+
+    old_media = int(base_acc.get("media_count") or 0)
+    new_media = int(new_acc.get("media_count") or 0)
+    merged["media_count"] = new_media if new_media > 0 else old_media
+
+    old_posts = base_acc.get("posts_list") if isinstance(base_acc.get("posts_list"), list) else []
+    new_posts = new_acc.get("posts_list") if isinstance(new_acc.get("posts_list"), list) else []
+    merged["posts_list"] = new_posts if len(new_posts) > 0 else old_posts
+
+    old_ts = base_acc.get("metrics_updated_at", "")
+    new_ts = new_acc.get("metrics_updated_at", "")
+    if not new_ts or new_ts == "Sem coleta antes da queda":
+        if old_ts and old_ts != "Sem coleta antes da queda":
+            merged["metrics_updated_at"] = old_ts
+
+    return merged
+
+
+def get_env_accounts():
+    """
+    Lê as contas de ACCOUNTS_CONFIG_JSON e também mescla com quaisquer métricas
+    salvas em `contas_conectadas.json` ou `contas_monitoradas.json` da pasta do projeto.
+    """
+    raw = os.environ.get("ACCOUNTS_CONFIG_JSON", "").strip()
+    accounts_dict = {}
+
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and "accounts" in data and isinstance(data["accounts"], dict):
+                data = data["accounts"]
+
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        uid = str(item.get("ig_user_id", "")).strip()
+                        if uid:
+                            accounts_dict[uid] = dict(item)
+            elif isinstance(data, dict):
+                for uid, item in data.items():
+                    if isinstance(item, dict):
+                        item_copy = dict(item)
+                        item_copy["ig_user_id"] = str(item_copy.get("ig_user_id") or uid)
+                        accounts_dict[str(uid)] = item_copy
+        except Exception as e:
+            print(f"[ERRO] Falha ao ler ACCOUNTS_CONFIG_JSON: {e}", flush=True)
+
+    # Mescla dados do contas_conectadas.json local (se existir) para aproveitar tokens e métricas já coletadas no Código 1
+    if os.path.exists(CODIGO1_ACCOUNTS_FILE):
+        try:
+            c1_data = load_json(CODIGO1_ACCOUNTS_FILE, {})
+            if isinstance(c1_data, dict):
+                for uid, item in c1_data.items():
+                    if isinstance(item, dict):
+                        uid_str = str(item.get("ig_user_id") or uid)
+                        if uid_str in accounts_dict:
+                            accounts_dict[uid_str] = merge_best_account_data(item, accounts_dict[uid_str])
+                            if not accounts_dict[uid_str].get("access_token") and item.get("access_token"):
+                                accounts_dict[uid_str]["access_token"] = item["access_token"]
+                        else:
+                            item_copy = dict(item)
+                            item_copy["ig_user_id"] = uid_str
+                            accounts_dict[uid_str] = item_copy
+        except Exception as e:
+            print(f"[ERRO] Falha ao ler contas_conectadas.json: {e}", flush=True)
+
+    return accounts_dict
 
 
 def get_saved_state():
+    """
+    Carrega e mescla TODAS as fontes possíveis de histórico:
+    1) Semente do `ACCOUNTS_CONFIG_JSON` / `contas_conectadas.json`
+    2) Arquivo `contas_monitoradas.json` da pasta raiz do projeto
+    3) Arquivo `/tmp/contas_monitoradas.json` (runtime)
+    4) Cache em memória (`MEMORY_CACHE_ACCOUNTS`)
+    Assim, mesmo se o /tmp da Vercel reiniciar, ele recupera os últimos dados conhecidos!
+    """
     with ACCOUNTS_LOCK:
-        return load_json(ACCOUNTS_FILE, {
-            "last_global_sync_ts": 0,
-            "last_global_sync_str": "Ainda não sincronizado",
-            "accounts": {}
-        })
+        merged_accounts = {}
+        last_ts = 0
+        last_str = "Ainda não sincronizado"
+
+        # 1. Dados vindos da configuração/ambiente ou Código 1
+        env_accs = get_env_accounts()
+        for uid, acc in env_accs.items():
+            clean_acc = dict(acc)
+            clean_acc.pop("access_token", None)
+            merged_accounts[uid] = merge_best_account_data(merged_accounts.get(uid, {}), clean_acc)
+
+        # 2. Dados do arquivo contas_monitoradas.json na raiz do projeto (se existir)
+        if os.path.exists(BUNDLED_MONITOR_FILE):
+            bundled = load_json(BUNDLED_MONITOR_FILE, {})
+            if isinstance(bundled, dict):
+                b_accs = bundled.get("accounts", bundled if "last_global_sync_ts" not in bundled else {})
+                if isinstance(b_accs, dict):
+                    for uid, acc in b_accs.items():
+                        if isinstance(acc, dict):
+                            acc_clean = dict(acc)
+                            acc_clean.pop("access_token", None)
+                            merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc_clean)
+                if bundled.get("last_global_sync_ts", 0) > last_ts:
+                    last_ts = bundled["last_global_sync_ts"]
+                    last_str = bundled.get("last_global_sync_str", last_str)
+
+        # 3. Dados do arquivo runtime (/tmp ou local)
+        if os.path.exists(RUNTIME_ACCOUNTS_FILE):
+            runtime = load_json(RUNTIME_ACCOUNTS_FILE, {})
+            if isinstance(runtime, dict):
+                r_accs = runtime.get("accounts", {})
+                if isinstance(r_accs, dict):
+                    for uid, acc in r_accs.items():
+                        if isinstance(acc, dict):
+                            acc_clean = dict(acc)
+                            acc_clean.pop("access_token", None)
+                            merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc_clean)
+                if runtime.get("last_global_sync_ts", 0) > last_ts:
+                    last_ts = runtime["last_global_sync_ts"]
+                    last_str = runtime.get("last_global_sync_str", last_str)
+
+        # 4. Cache em memória RAM
+        for uid, acc in MEMORY_CACHE_ACCOUNTS.items():
+            if isinstance(acc, dict):
+                merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc)
+
+        sorted_accs = sort_accounts_by_views_desc(merged_accounts)
+        return {
+            "last_global_sync_ts": last_ts,
+            "last_global_sync_str": last_str,
+            "accounts": sorted_accs
+        }
 
 
 def save_current_state(state_data):
     with ACCOUNTS_LOCK:
-        save_json(ACCOUNTS_FILE, state_data)
+        if isinstance(state_data, dict) and isinstance(state_data.get("accounts"), dict):
+            for uid, acc in state_data["accounts"].items():
+                MEMORY_CACHE_ACCOUNTS[str(uid)] = merge_best_account_data(
+                    MEMORY_CACHE_ACCOUNTS.get(str(uid), {}), acc
+                )
+            state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
+
+        save_json(RUNTIME_ACCOUNTS_FILE, state_data)
+        # Se a pasta do projeto tiver permissão de escrita (PC local ou VPS), salva nela também
+        if RUNTIME_ACCOUNTS_FILE != BUNDLED_MONITOR_FILE and os.access(BASE_DIR, os.W_OK):
+            save_json(BUNDLED_MONITOR_FILE, state_data)
 
 
 # ==============================================================================
-# SEGURANÇA: LOGIN OBRIGATÓRIO (DASHBOARD_USER e DASHBOARD_PASS) E VARIÁVEIS
+# SEGURANÇA: LOGIN OBRIGATÓRIO (DASHBOARD_USER e DASHBOARD_PASS)
 # ==============================================================================
-
-def get_env_accounts():
-    """
-    Lê as contas e tokens da variável de ambiente ACCOUNTS_CONFIG_JSON.
-    Assim os tokens nunca ficam expostos no código nem no .json salvo.
-    """
-    raw = os.environ.get("ACCOUNTS_CONFIG_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        accounts_dict = {}
-        if isinstance(data, list):
-            for item in data:
-                uid = str(item.get("ig_user_id", "")).strip()
-                if uid and item.get("access_token"):
-                    accounts_dict[uid] = item
-        elif isinstance(data, dict):
-            for uid, item in data.items():
-                if isinstance(item, dict) and item.get("access_token"):
-                    item["ig_user_id"] = str(item.get("ig_user_id") or uid)
-                    accounts_dict[str(uid)] = item
-        return accounts_dict
-    except Exception as e:
-        print(f"[ERRO] Falha ao ler ACCOUNTS_CONFIG_JSON: {e}", flush=True)
-        return {}
-
 
 def check_basic_auth(username, password):
     expected_user = os.environ.get("DASHBOARD_USER", "").strip()
     expected_pass = os.environ.get("DASHBOARD_PASS", "").strip()
-    # Se as variáveis ainda não foram configuradas no servidor, bloqueia por segurança
     if not expected_user or not expected_pass:
         return False
     return (
@@ -163,7 +316,7 @@ def add_security_headers(response):
 
 
 # ==============================================================================
-# COLETOR DE MÉTRICAS (ATUALIZA APENAS OS DADOS ATUAIS NO .JSON)
+# COLETOR DE MÉTRICAS BLINDADO (NUNCA ZERA SEGUIDORES OU VIEWS SE A CONTA CAIR)
 # ==============================================================================
 
 def _fetch_single_media_views(media_item, access_token):
@@ -252,26 +405,43 @@ def _classify_instagram_account_status(profile_ok, profile_err_obj, pub_limit_re
 
 def fetch_account_current_metrics(acc_config, last_json_entry):
     """
-    Busca os números atuais na Meta e retorna o objeto atualizado para ser salvo no .json.
-    - Se a conta responder: substitui todos os números pelos atuais da consulta.
-    - Se a conta tiver caído: mantém os números que já estavam no .json da última consulta válida,
-      atualizando apenas o status para indicar a queda.
+    Busca os números atuais na Meta e NUNCA apaga nem reduz para zero os seguidores,
+    visualizações totais ou lista de posts que já estavam salvos anteriormente.
     """
     ig_user_id = str(acc_config.get("ig_user_id", ""))
     access_token = acc_config.get("access_token", "")
     now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
 
-    current = dict(last_json_entry) if isinstance(last_json_entry, dict) else {}
+    # Une os melhores dados já conhecidos (do .json anterior + do próprio config inicial)
+    previous_best = merge_best_account_data(acc_config, last_json_entry)
+    prev_followers = int(previous_best.get("followers_count") or 0)
+    prev_views = int(previous_best.get("total_views") or 0)
+    prev_media_count = int(previous_best.get("media_count") or 0)
+    prev_posts_list = previous_best.get("posts_list") if isinstance(previous_best.get("posts_list"), list) else []
+    prev_updated_at = previous_best.get("metrics_updated_at") or "Sem coleta antes da queda"
+
+    current = dict(previous_best)
     current["ig_user_id"] = ig_user_id
-    current["username"] = acc_config.get("username") or current.get("username") or f"user_{ig_user_id}"
-    current["label"] = acc_config.get("label") or current.get("label") or "Conta"
-    current["connected_at"] = acc_config.get("connected_at") or current.get("connected_at") or "—"
-    current["token_type_label"] = acc_config.get("token_type_label") or current.get("token_type_label") or "Longa Duração (60 dias)"
+    current["username"] = previous_best.get("username") or acc_config.get("username") or f"user_{ig_user_id}"
+    current["label"] = acc_config.get("label") or previous_best.get("label") or "Conta"
+    current["connected_at"] = acc_config.get("connected_at") or previous_best.get("connected_at") or "—"
+    current["token_type_label"] = acc_config.get("token_type_label") or previous_best.get("token_type_label") or "Longa Duração (60 dias)"
+
+    if not access_token:
+        current["account_status"] = previous_best.get("account_status", "Sem Token / Histórico")
+        current["account_status_badge"] = previous_best.get("account_status_badge", "warning")
+        current["followers_count"] = prev_followers
+        current["total_views"] = prev_views
+        current["media_count"] = prev_media_count
+        current["posts_list"] = prev_posts_list
+        current["metrics_updated_at"] = prev_updated_at
+        current.pop("access_token", None)
+        return current
 
     profile_ok = False
     last_profile_error = {}
-    followers_count = None
-    media_count = None
+    fetched_followers = None
+    fetched_media_count = None
 
     for endpoint in (
         f"https://graph.instagram.com/{GRAPH_API_VERSION}/{ig_user_id}",
@@ -291,11 +461,11 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                 profile_ok = True
                 if p_data.get("username"):
                     current["username"] = p_data["username"]
-                if "followers_count" in p_data:
-                    followers_count = int(p_data["followers_count"])
-                if "media_count" in p_data:
-                    media_count = int(p_data["media_count"])
-                if followers_count is not None:
+                if "followers_count" in p_data and p_data["followers_count"] is not None:
+                    fetched_followers = int(p_data["followers_count"])
+                if "media_count" in p_data and p_data["media_count"] is not None:
+                    fetched_media_count = int(p_data["media_count"])
+                if fetched_followers is not None:
                     break
             else:
                 if isinstance(p_data, dict) and "error" in p_data:
@@ -322,20 +492,21 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
     current["account_status_badge"] = status_badge
     current["account_status_detail"] = status_detail
 
-    # Se a conta caiu, NÃO zera os números do .json! Mantém os últimos números válidos.
+    # Se a conta caiu no perfil, preserva 100% dos números e posts anteriores!
     if not profile_ok:
-        current.setdefault("followers_count", 0)
-        current.setdefault("total_views", 0)
-        current.setdefault("media_count", 0)
-        current.setdefault("posts_list", [])
-        current.setdefault("metrics_updated_at", "Sem coleta antes da queda")
+        current["followers_count"] = prev_followers
+        current["total_views"] = prev_views
+        current["media_count"] = prev_media_count
+        current["posts_list"] = sorted(prev_posts_list, key=lambda x: x.get("views", 0), reverse=True)
+        current["metrics_updated_at"] = prev_updated_at
         current.pop("access_token", None)
         return current
 
-    # Conta ativa: puxa a lista atual de mídias e calcula visualizações
+    # Conta respondeu no perfil: tenta puxar as mídias
     all_media = []
     media_url = f"https://graph.instagram.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
     inline_ok = False
+    media_fetch_error = False
 
     try:
         next_url = media_url
@@ -378,9 +549,17 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                     next_url = data_m.get("paging", {}).get("next")
                     params = None
                 else:
+                    if "error" in data_m:
+                        media_fetch_error = True
                     break
         except Exception:
-            pass
+            media_fetch_error = True
+
+    # Mapeia views antigos por ID de post caso algum insight individual falhe
+    prev_views_by_post_id = {
+        str(p.get("id")): int(p.get("views") or 0)
+        for p in prev_posts_list if isinstance(p, dict) and p.get("id")
+    }
 
     total_views = 0
     media_views_map = {}
@@ -394,7 +573,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
             for metric_entry in insights_obj.get("data", []):
                 vals = metric_entry.get("values", [])
                 if vals and isinstance(vals[0].get("value"), (int, float)):
-                    v_count = int(vals[0]["value"])
+                    v_count = max(int(vals[0]["value"]), prev_views_by_post_id.get(str(mid), 0))
                     total_views += v_count
                     if mid:
                         media_views_map[mid] = v_count
@@ -411,16 +590,19 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
             }
             for mid, fut in future_by_id.items():
                 try:
-                    v_count = int(fut.result() or 0)
-                    media_views_map[mid] = v_count
-                    total_views += v_count
+                    fetched_v = int(fut.result() or 0)
+                    best_v = max(fetched_v, prev_views_by_post_id.get(str(mid), 0))
+                    media_views_map[mid] = best_v
+                    total_views += best_v
                 except Exception:
-                    media_views_map[mid] = 0
+                    fallback_v = prev_views_by_post_id.get(str(mid), 0)
+                    media_views_map[mid] = fallback_v
+                    total_views += fallback_v
 
     posts_ranked = []
     for m_item in all_media:
         mid = m_item.get("id", "")
-        v_count = int(media_views_map.get(mid, 0))
+        v_count = int(media_views_map.get(mid, prev_views_by_post_id.get(str(mid), 0)))
         shortcode = m_item.get("shortcode", "")
         permalink = (m_item.get("permalink") or "").strip()
         if not permalink and shortcode:
@@ -450,21 +632,41 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
 
     posts_ranked.sort(key=lambda x: x.get("views", 0), reverse=True)
 
-    # Sobrescreve com os dados atuais da consulta
-    current["posts_list"] = posts_ranked
-    current["followers_count"] = followers_count if followers_count is not None else 0
-    current["total_views"] = total_views
-    current["media_count"] = media_count if media_count is not None else len(all_media)
-    current["metrics_updated_at"] = now_str
+    # BLINDAGEM CONTRA QUEDA PARCIAL:
+    # Se a API retornou 0 mídias ou 0 views mas a conta já tinha posts/views registrados antes, mantém os anteriores!
+    if len(posts_ranked) > 0:
+        current["posts_list"] = posts_ranked
+    else:
+        current["posts_list"] = sorted(prev_posts_list, key=lambda x: x.get("views", 0), reverse=True)
 
-    # Nunca salva o token dentro do .json de visualização
+    if fetched_followers is not None and (fetched_followers > 0 or prev_followers == 0):
+        current["followers_count"] = fetched_followers
+    else:
+        current["followers_count"] = prev_followers
+
+    # Nunca deixa total_views cair para 0 ou diminuir por falha de paginação/insights da API
+    current["total_views"] = max(total_views, prev_views)
+
+    if fetched_media_count is not None and (fetched_media_count > 0 or prev_media_count == 0):
+        current["media_count"] = fetched_media_count
+    elif len(posts_ranked) > 0:
+        current["media_count"] = len(posts_ranked)
+    else:
+        current["media_count"] = prev_media_count
+
+    if not media_fetch_error:
+        current["metrics_updated_at"] = now_str
+    else:
+        current["metrics_updated_at"] = prev_updated_at
+
     current.pop("access_token", None)
     return current
 
 
 def refresh_all_accounts_to_json():
     """
-    Atualiza todas as contas e sobrescreve o arquivo .json local com os números atuais.
+    Atualiza todas as contas preservando os melhores dados históricos de contas caídas
+    e ordena da conta com MAIS visualizações no topo para a com MENOS embaixo.
     """
     with SYNC_LOCK:
         env_accounts = get_env_accounts()
@@ -472,10 +674,13 @@ def refresh_all_accounts_to_json():
         saved_accounts = saved_state.get("accounts", {}) if isinstance(saved_state, dict) else {}
 
         if not env_accounts:
+            if saved_accounts:
+                saved_state["accounts"] = sort_accounts_by_views_desc(saved_accounts)
+                save_current_state(saved_state)
             return saved_state
 
         acc_ids = list(env_accounts.keys())
-        new_accounts_map = {}
+        new_accounts_map = dict(saved_accounts)
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
@@ -488,11 +693,16 @@ def refresh_all_accounts_to_json():
             }
             for acc_id, fut in futures.items():
                 try:
-                    new_accounts_map[acc_id] = fut.result()
+                    updated_acc = fut.result()
+                    new_accounts_map[acc_id] = merge_best_account_data(
+                        saved_accounts.get(acc_id, {}), updated_acc
+                    )
                 except Exception as e:
                     print(f"[AVISO MÉTRICAS] Falha ao atualizar conta {acc_id}: {e}", flush=True)
                     if acc_id in saved_accounts:
                         new_accounts_map[acc_id] = saved_accounts[acc_id]
+
+        sorted_accounts_map = sort_accounts_by_views_desc(new_accounts_map)
 
         now_ts = time.time()
         now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
@@ -500,19 +710,17 @@ def refresh_all_accounts_to_json():
         updated_state = {
             "last_global_sync_ts": now_ts,
             "last_global_sync_str": now_str,
-            "accounts": new_accounts_map
+            "accounts": sorted_accounts_map
         }
         save_current_state(updated_state)
         return updated_state
 
 
 # ==============================================================================
-# THREAD LOCAL DE 5 EM 5 MINUTOS (CASO RODE EM SERVIDOR LIGADO 24H)
-# + SUPORTE A CRON EXTERNO (CASO RODE NA VERCEL)
+# THREAD LOCAL DE 5 EM 5 MINUTOS
 # ==============================================================================
 
 def background_5min_loop():
-    """Roda a cada 5 minutos (300s) automaticamente enquanto o processo estiver ativo."""
     while True:
         try:
             state = get_saved_state()
@@ -529,7 +737,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML SOMENTE LEITURA (TABELA 3. CONTAS CONECTADAS)
+# TEMPLATE HTML (CONTAS ORDENADAS POR VIEWS + MENU SUSPENSO + BACKUP VERCEL)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -538,7 +746,7 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Monitor 24h — Contas Conectadas</title>
+    <title>Monitor 24h — Contas Conectadas (Ordenadas por Visualizações)</title>
     <style>
         :root {
             --bg: #0f172a;
@@ -566,38 +774,81 @@ HTML_TEMPLATE = r"""
         .badge.info { background: rgba(56, 189, 248, 0.2); color: #38bdf8; }
         .badge.error { background: rgba(239, 68, 68, 0.2); color: #f87171; }
         .metric-val { font-weight: 700; color: #f8fafc; font-size: 0.95rem; }
-        .posts-toggle-btn {
-            margin-top: 0; padding: 3px 7px; width: auto; font-size: 0.78rem; border-radius: 5px;
-            background: #334155; color: #38bdf8; border: 1px solid #475569; cursor: pointer;
-            line-height: 1; display: inline-flex; align-items: center; justify-content: center; transition: 0.15s;
+        button.small-btn {
+            margin-top: 0; padding: 7px 13px; width: auto; font-size: 0.82rem; border-radius: 6px;
+            background: #3b82f6; color: white; border: none; font-weight: 600; cursor: pointer; transition: 0.2s;
         }
-        .posts-toggle-btn:hover { background: #475569; color: #ffffff; border-color: #38bdf8; }
-        .posts-dropdown-row { background: #0b1120; }
+        button.small-btn:hover { background: #2563eb; }
+        button.small-btn.secondary { background: #0f766e; }
+        button.small-btn.secondary:hover { background: #115e59; }
+        .posts-toggle-btn {
+            margin-top: 0;
+            padding: 3px 7px;
+            width: auto;
+            font-size: 0.78rem;
+            border-radius: 5px;
+            background: #334155;
+            color: #38bdf8;
+            border: 1px solid #475569;
+            cursor: pointer;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: 0.15s;
+        }
+        .posts-toggle-btn:hover {
+            background: #475569;
+            color: #ffffff;
+            border-color: #38bdf8;
+        }
+        .posts-dropdown-row {
+            background: #0b1120;
+        }
         .posts-dropdown-box {
-            padding: 12px 14px; border-radius: 8px; background: #111a2e;
-            border: 1px solid var(--border); max-height: 280px; overflow-y: auto;
+            padding: 12px 14px;
+            border-radius: 8px;
+            background: #111a2e;
+            border: 1px solid var(--border);
+            max-height: 280px;
+            overflow-y: auto;
         }
         .post-rank-item {
-            display: flex; justify-content: space-between; align-items: center;
-            gap: 12px; padding: 8px 10px; border-bottom: 1px solid #1e293b; font-size: 0.84rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 10px;
+            border-bottom: 1px solid #1e293b;
+            font-size: 0.84rem;
         }
-        .post-rank-item:last-child { border-bottom: none; }
-        .post-rank-link { color: #38bdf8; text-decoration: none; font-weight: 600; word-break: break-all; }
-        .post-rank-link:hover { text-decoration: underline; color: #7dd3fc; }
+        .post-rank-item:last-child {
+            border-bottom: none;
+        }
+        .post-rank-link {
+            color: #38bdf8;
+            text-decoration: none;
+            font-weight: 600;
+            word-break: break-all;
+        }
+        .post-rank-link:hover {
+            text-decoration: underline;
+            color: #7dd3fc;
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
         <div>
-            <h1>Painel de Monitoramento 24h (Somente Visualização)</h1>
+            <h1>Painel de Monitoramento 24h (Ordenado por Visualizações)</h1>
             <div class="hint">
-                🔒 <b>Banco Local (.json) • Atualização automática a cada 5 minutos:</b> Exibe apenas os dados mais recentes de cada conta. Se uma conta cair, os últimos números permanecem salvos no <code>.json</code>.
+                🔒 <b>Proteção Anti-Zeramento Ativa:</b> Se uma conta cair ou bloquear a API, os últimos seguidores, visualizações e lista de posts nunca são zerados.
             </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <div class="badge info" style="font-size:0.86rem; padding:8px 12px;">
-                🔄 Última Atualização (5 min): <b>{{ last_sync }}</b>
+                🔄 Última Atualização: <b>{{ last_sync }}</b>
             </div>
             <div class="badge success" style="font-size:0.82rem; padding:8px 12px;">
                 ⏱️ Recarregando tela em: <span id="reloadCountdown">60s</span>
@@ -605,13 +856,23 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
-    <!-- 3. CONTAS CONECTADAS (SOMENTE LEITURA) -->
+    <!-- 3. CONTAS CONECTADAS (ORDENADAS DA MAIOR VISUALIZAÇÃO NO TOPO PARA A MENOR EMBAIXO) -->
     <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-            <h2>3. Contas Conectadas ({{ accounts|length }})</h2>
-            <div style="display:flex; gap:14px; font-size:0.88rem; color:var(--muted);">
-                <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
-                <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
+            <div>
+                <h2>3. Contas Conectadas ({{ accounts|length }}) — Mais Visualizações no Topo ↓</h2>
+                <div style="display:flex; gap:14px; font-size:0.88rem; color:var(--muted); margin-top:4px;">
+                    <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
+                    <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
+                </div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="small-btn secondary" onclick="copiarSnapshotVercel(this)" title="Copia o JSON completo com tokens + seguidores + views atuais para colar em ACCOUNTS_CONFIG_JSON na Vercel">
+                    💾 Copiar Snapshot JSON (Salva Histórico na Vercel)
+                </button>
+                <button type="button" class="small-btn" onclick="atualizarMetricasContas(this)">
+                    🔄 Atualizar Seguidores, Visualizações e Posts
+                </button>
             </div>
         </div>
 
@@ -620,11 +881,11 @@ HTML_TEMPLATE = r"""
             <table>
                 <thead>
                     <tr>
-                        <th style="width:55px; text-align:center;">Posts</th>
+                        <th style="width:90px; text-align:center;">Rank / Posts</th>
                         <th>@Username</th>
                         <th>Status da Conta (Instagram)</th>
                         <th>Seguidores</th>
-                        <th>Visualizações Totais (Posts)</th>
+                        <th>Visualizações Totais (Posts) ↓</th>
                         <th>IG User ID</th>
                         <th>Etiqueta</th>
                         <th>Última Coleta Válida</th>
@@ -636,9 +897,12 @@ HTML_TEMPLATE = r"""
                     {% set posts_ordenados = acc.get('posts_list', []) %}
                     <tr>
                         <td style="text-align:center; white-space:nowrap;">
-                            <button type="button" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts ordenados por visualizações (maior no topo)">
-                                ↓
-                            </button>
+                            <div style="display:inline-flex; align-items:center; gap:6px;">
+                                <span class="badge info" style="min-width:32px; text-align:center;">#{{ loop.index }}</span>
+                                <button type="button" id="btn_toggle_{{ acc_id }}" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts ordenados por visualizações (maior no topo)">
+                                    ↓
+                                </button>
+                            </div>
                         </td>
                         <td><b>@{{ acc.username }}</b></td>
                         <td>
@@ -693,7 +957,7 @@ HTML_TEMPLATE = r"""
                                     {% endfor %}
                                 {% else %}
                                     <div class="hint" style="margin:0; color:#fbbf24;">
-                                        Nenhum post carregado para esta conta.
+                                        Nenhum post carregado ainda ou esta conta caiu antes da primeira sincronização de posts.
                                     </div>
                                 {% endif %}
                             </div>
@@ -704,7 +968,7 @@ HTML_TEMPLATE = r"""
             </table>
         </div>
         {% else %}
-        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada em <code>ACCOUNTS_CONFIG_JSON</code> ainda.</p>
+        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada em <code>ACCOUNTS_CONFIG_JSON</code> (ou <code>contas_conectadas.json</code>) ainda.</p>
         {% endif %}
     </div>
 </div>
@@ -725,13 +989,38 @@ HTML_TEMPLATE = r"""
         } catch (e) {}
     }
 
+    function atualizarMetricasContas(btn) {
+        btn.disabled = true;
+        btn.innerText = '⏳ Atualizando métricas e posts na Meta...';
+        window.location.href = '/atualizar_metricas';
+    }
+
+    async function copiarSnapshotVercel(btn) {
+        const origText = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = '⏳ Gerando JSON...';
+        try {
+            const res = await fetch('/api/export_snapshot');
+            const data = await res.json();
+            await navigator.clipboard.writeText(JSON.stringify(data));
+            alert('✅ Snapshot JSON copiado para a área de transferência! Se você colar esse JSON na variável ACCOUNTS_CONFIG_JSON da Vercel (ou em contas_conectadas.json), mesmo que o servidor da Vercel reinicie, os seguidores, views e posts atuais nunca serão perdidos.');
+        } catch (e) {
+            alert('Erro ao copiar JSON: ' + e);
+        } finally {
+            btn.disabled = false;
+            btn.innerText = origText;
+        }
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
         try {
             const openState = JSON.parse(sessionStorage.getItem('open_posts_rows') || '{}');
             Object.keys(openState).forEach(accId => {
                 if (openState[accId]) {
                     const row = document.getElementById('posts_row_' + accId);
+                    const btn = document.getElementById('btn_toggle_' + accId);
                     if (row) row.style.display = 'table-row';
+                    if (btn) btn.innerText = '↑';
                 }
             });
         } catch (e) {}
@@ -753,7 +1042,7 @@ HTML_TEMPLATE = r"""
 
 
 # ==============================================================================
-# ROTAS FLASK (SOMENTE LEITURA + GATILHO DE 5 MINUTOS)
+# ROTAS FLASK
 # ==============================================================================
 
 @app.route("/", methods=["GET"])
@@ -761,12 +1050,12 @@ HTML_TEMPLATE = r"""
 def index():
     state = get_saved_state()
     last_ts = state.get("last_global_sync_ts", 0)
+    accounts = state.get("accounts", {})
 
-    # Se já passaram 5 minutos (300s) desde a última gravação no .json, atualiza agora
-    if time.time() - last_ts >= 300 or not state.get("accounts"):
+    if time.time() - last_ts >= 300 or not accounts:
         state = refresh_all_accounts_to_json()
 
-    accounts = state.get("accounts", {})
+    accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
     last_sync_str = state.get("last_global_sync_str", "—")
 
     total_followers = sum(int(acc.get("followers_count") or 0) for acc in accounts.values())
@@ -781,12 +1070,37 @@ def index():
     )
 
 
+@app.route("/atualizar_metricas", methods=["GET", "POST"])
+@requires_auth
+def atualizar_metricas():
+    refresh_all_accounts_to_json()
+    return redirect(url_for("index"))
+
+
+@app.route("/api/export_snapshot", methods=["GET"])
+@requires_auth
+def export_snapshot():
+    """
+    Exporta o dicionário completo combinando os access_tokens de ACCOUNTS_CONFIG_JSON
+    com as últimas métricas e posts coletados. Ideal para atualizar ACCOUNTS_CONFIG_JSON
+    ou subir o arquivo contas_conectadas.json para que a Vercel nunca perca a base em cold starts.
+    """
+    env_accs = get_env_accounts()
+    state = get_saved_state()
+    saved_accs = state.get("accounts", {})
+
+    export_dict = {}
+    for uid, env_item in env_accs.items():
+        merged = merge_best_account_data(env_item, saved_accs.get(uid, {}))
+        if env_item.get("access_token"):
+            merged["access_token"] = env_item["access_token"]
+        export_dict[uid] = merged
+
+    return jsonify(export_dict)
+
+
 @app.route("/api/cron/sync", methods=["GET", "POST"])
 def cron_sync():
-    """
-    Endpoint protegido por senha (CRON_SECRET) para ser chamado a cada 5 minutos
-    pelo cron-job.org na Vercel, mantendo o container acordado e o .json sempre atualizado.
-    """
     cron_secret = os.environ.get("CRON_SECRET", "").strip()
     if not cron_secret:
         return jsonify({"ok": False, "error": "CRON_SECRET não definido."}), 403
