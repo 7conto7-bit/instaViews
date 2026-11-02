@@ -20,8 +20,8 @@ GRAPH_API_VERSION = "v21.0"
 # ==============================================================================
 # CONFIGURAÇÃO UPSTASH REDIS (PERSISTÊNCIA DEFINITIVA NA VERCEL)
 # ==============================================================================
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 REDIS_STATE_KEY = "ig_monitor:state_v1"
 
 # Intervalo mínimo entre leituras diretas no Redis (em segundos) para poupar comandos
@@ -42,11 +42,13 @@ else:
 ACCOUNTS_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
 
-# Cache em memória do processo (evita bater no Upstash a cada reload de página)
+# Cache em memória do processo
 MEMORY_CACHE_ACCOUNTS = {}
 MEMORY_LAST_SYNC_TS = 0.0
 MEMORY_LAST_SYNC_STR = "Ainda não sincronizado"
 LAST_REDIS_FETCH_TS = 0.0
+
+# Flag que garante que o estado existente no Upstash foi lido com sucesso nesta instância
 REDIS_BOOTSTRAPPED = False
 
 
@@ -64,77 +66,130 @@ app.jinja_env.filters["fmt_num"] = format_number_br
 
 
 # ==============================================================================
-# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (REST API - ULTRA ECONÔMICO)
+# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (COM RETRY E PROTEÇÃO ANTI-SOBRESCRITA)
 # ==============================================================================
 
 def is_upstash_configured():
     return bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 
-def upstash_command(*args):
-    """Executa um único comando Redis diretamente via API REST do Upstash."""
+def upstash_command(*args, retries=3):
+    """
+    Executa um único comando Redis via API REST do Upstash com retry automático.
+    Retorna uma tupla: (sucesso_http: bool, resultado: any)
+    """
     if not is_upstash_configured():
-        return None
-    try:
-        r = requests.post(
-            UPSTASH_URL,
-            headers={
-                "Authorization": f"Bearer {UPSTASH_TOKEN}",
-                "Content-Type": "application/json"
-            },
-            json=list(args),
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.json().get("result")
-        else:
-            print(f"[AVISO UPSTASH] HTTP {r.status_code}: {r.text}", flush=True)
-    except Exception as e:
-        print(f"[ERRO UPSTASH] Falha na comunicação REST: {e}", flush=True)
-    return None
+        return False, None
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(
+                UPSTASH_URL,
+                headers={
+                    "Authorization": f"Bearer {UPSTASH_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json=list(args),
+                timeout=12
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "error" not in data:
+                    return True, data.get("result")
+                print(f"[ERRO UPSTASH PAYLOAD] {data.get('error')}", flush=True)
+            else:
+                print(f"[AVISO UPSTASH] Tentativa {attempt}/{retries} - HTTP {r.status_code}: {r.text}", flush=True)
+        except Exception as e:
+            print(f"[ERRO UPSTASH] Tentativa {attempt}/{retries} falhou: {e}", flush=True)
+
+        if attempt < retries:
+            time.sleep(0.8 * attempt)
+
+    return False, None
 
 
 def load_state_from_upstash():
     """
-    Carrega o estado global salvo no Upstash Redis usando APENAS 1 comando (GET).
+    Carrega o estado global salvo no Upstash Redis usando 1 comando (GET).
+    Retorna: (leitura_concluida_com_sucesso: bool, dados_do_estado: dict)
     """
     if not is_upstash_configured():
-        return {}
+        return False, {}
 
-    raw_state = upstash_command("GET", REDIS_STATE_KEY)
-    if raw_state and isinstance(raw_state, str):
+    ok, raw_state = upstash_command("GET", REDIS_STATE_KEY)
+    if not ok:
+        # Falha de rede ou credencial: retorna False para NÃO marcar REDIS_BOOTSTRAPPED
+        # e impedir que a instância sobrescreva o Redis com dados zerados!
+        return False, {}
+
+    if raw_state is None:
+        # Chave ainda não existe no banco (primeiro uso real), mas a comunicação funcionou
+        return True, {}
+
+    if isinstance(raw_state, str):
         try:
             parsed = json.loads(raw_state)
             if isinstance(parsed, dict):
-                return parsed
+                return True, parsed
         except Exception as e:
             print(f"[ERRO UPSTASH PARSE STATE]: {e}", flush=True)
+            return False, {}
+    elif isinstance(raw_state, dict):
+        return True, raw_state
 
-    return {}
+    return False, {}
 
 
 def save_state_to_upstash(state_data):
     """
-    Salva o estado completo no Upstash Redis usando APENAS 1 comando (SET).
-    O merge seguro já é feito previamente com a memória/cache local, evitando
-    leituras e gravações múltiplas desnecessárias.
+    Salva o estado completo no Upstash Redis usando 1 comando (SET).
+    PROTEÇÃO CRÍTICA: Nunca sobrescreve o Upstash se a instância atual ainda não
+    tiver conseguido ler o estado anterior do Upstash (evita zerar contas no cold start).
     """
-    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED
+    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR
     if not is_upstash_configured() or not isinstance(state_data, dict):
         return False
 
     try:
+        # Se por algum motivo esta instância ainda não leu o Redis com sucesso,
+        # obriga a ler agora antes de salvar para NUNCA perder dados antigos de contas caídas.
+        if not REDIS_BOOTSTRAPPED:
+            ok_read, remote_state = load_state_from_upstash()
+            if not ok_read:
+                print(
+                    "[PROTEÇÃO ANTI-ZERAMENTO] Abortando escrita no Upstash pois a leitura prévia falhou. "
+                    "Isso protege os dados históricos no Redis contra sobrescrita a frio.",
+                    flush=True
+                )
+                return False
+
+            # Mescla imediatamente os dados remotos na memória antes de prosseguir
+            remote_accs = remote_state.get("accounts", {}) if isinstance(remote_state, dict) else {}
+            if isinstance(remote_accs, dict):
+                for r_uid, r_acc in remote_accs.items():
+                    if isinstance(r_acc, dict):
+                        uid_s = str(r_uid)
+                        MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
+                            r_acc, MEMORY_CACHE_ACCOUNTS.get(uid_s, {})
+                        )
+            if float(remote_state.get("last_global_sync_ts") or 0) > MEMORY_LAST_SYNC_TS:
+                MEMORY_LAST_SYNC_TS = float(remote_state["last_global_sync_ts"])
+                MEMORY_LAST_SYNC_STR = remote_state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR)
+
+            REDIS_BOOTSTRAPPED = True
+
         new_accs = state_data.get("accounts", {}) if isinstance(state_data.get("accounts"), dict) else {}
         cleaned_accs = {}
 
-        for uid, acc_obj in new_accs.items():
-            uid_str = str(uid)
-            clean_merged = merge_best_account_data(
-                MEMORY_CACHE_ACCOUNTS.get(uid_str, {}),
-                acc_obj
-            )
+        # Garante que todas as contas da memória + novas contas sejam preservadas pelo maior valor
+        all_uids = set(MEMORY_CACHE_ACCOUNTS.keys()) | set(str(k) for k in new_accs.keys())
+        for uid_str in all_uids:
+            mem_acc = MEMORY_CACHE_ACCOUNTS.get(uid_str, {})
+            inc_acc = new_accs.get(uid_str, {})
+            clean_merged = merge_best_account_data(mem_acc, inc_acc)
             clean_merged.pop("access_token", None)
             cleaned_accs[uid_str] = clean_merged
+            MEMORY_CACHE_ACCOUNTS[uid_str] = clean_merged
 
         sorted_accs = sort_accounts_by_views_desc(cleaned_accs)
         state_to_save = {
@@ -144,19 +199,19 @@ def save_state_to_upstash(state_data):
             ),
             "last_global_sync_str": (
                 state_data.get("last_global_sync_str")
-                or MEMORY_LAST_SYNC_STR
-                or "—"
+                if (state_data.get("last_global_sync_str") and state_data.get("last_global_sync_str") != "Ainda não sincronizado")
+                else (MEMORY_LAST_SYNC_STR or "—")
             ),
             "accounts": sorted_accs
         }
 
-        # Envia 1 único comando SET com todo o estado consolidado
-        upstash_command("SET", REDIS_STATE_KEY, json.dumps(state_to_save, ensure_ascii=False))
-
-        state_data["accounts"] = sorted_accs
-        LAST_REDIS_FETCH_TS = time.time()
-        REDIS_BOOTSTRAPPED = True
-        return True
+        ok_set, _ = upstash_command("SET", REDIS_STATE_KEY, json.dumps(state_to_save, ensure_ascii=False))
+        if ok_set:
+            state_data["accounts"] = sorted_accs
+            LAST_REDIS_FETCH_TS = time.time()
+            REDIS_BOOTSTRAPPED = True
+            return True
+        return False
     except Exception as e:
         print(f"[ERRO AO SALVAR NO UPSTASH]: {e}", flush=True)
         return False
@@ -209,10 +264,22 @@ def sort_accounts_by_views_desc(accounts_dict):
     return dict(sorted_items)
 
 
+def _safe_int(val):
+    try:
+        if val is None or val == "":
+            return 0
+        if isinstance(val, str):
+            val = val.replace(".", "").replace(",", "").strip()
+        return max(0, int(float(val)))
+    except Exception:
+        return 0
+
+
 def merge_best_account_data(base_acc, new_acc):
     """
     Combina duas versões dos dados de uma mesma conta garantindo que NUNCA
     se percam seguidores, visualizações ou lista de posts caso uma fonte esteja zerada.
+    Usa sempre max() entre o histórico salvo e a leitura nova.
     """
     if not isinstance(base_acc, dict):
         base_acc = {}
@@ -224,59 +291,70 @@ def merge_best_account_data(base_acc, new_acc):
         if v is not None and v != "":
             merged[k] = v
 
-    # Garante que seguidores, views e media_count nunca sejam sobrescritos por 0 se já havia valor > 0
-    old_followers = int(base_acc.get("followers_count") or 0)
-    new_followers = int(new_acc.get("followers_count") or 0)
-    merged["followers_count"] = new_followers if new_followers > 0 else old_followers
+    # NUNCA permite que seguidores, views ou media_count diminuam para zero
+    old_followers = _safe_int(base_acc.get("followers_count"))
+    new_followers = _safe_int(new_acc.get("followers_count"))
+    merged["followers_count"] = max(old_followers, new_followers)
 
-    old_views = int(base_acc.get("total_views") or 0)
-    new_views = int(new_acc.get("total_views") or 0)
+    old_views = _safe_int(base_acc.get("total_views"))
+    new_views = _safe_int(new_acc.get("total_views"))
     merged["total_views"] = max(old_views, new_views)
 
-    old_media = int(base_acc.get("media_count") or 0)
-    new_media = int(new_acc.get("media_count") or 0)
-    merged["media_count"] = new_media if new_media > 0 else old_media
+    old_media = _safe_int(base_acc.get("media_count"))
+    new_media = _safe_int(new_acc.get("media_count"))
+    merged["media_count"] = max(old_media, new_media)
 
-    # Mescla a lista de posts preservando o maior número de views de cada post
+    # Mescla a lista de posts preservando todos os posts já vistos e o maior número de views de cada um
     old_posts = base_acc.get("posts_list") if isinstance(base_acc.get("posts_list"), list) else []
     new_posts = new_acc.get("posts_list") if isinstance(new_acc.get("posts_list"), list) else []
 
-    if len(new_posts) > 0 and len(old_posts) > 0:
+    if len(new_posts) > 0 or len(old_posts) > 0:
         posts_by_id = {}
         for p in old_posts:
             if isinstance(p, dict) and p.get("id"):
-                posts_by_id[str(p["id"])] = dict(p)
+                pid = str(p["id"])
+                p_copy = dict(p)
+                p_copy["views"] = _safe_int(p.get("views"))
+                posts_by_id[pid] = p_copy
+
         for p in new_posts:
             if isinstance(p, dict) and p.get("id"):
                 pid = str(p["id"])
                 if pid in posts_by_id:
                     best_p = dict(posts_by_id[pid])
                     best_p.update(p)
-                    best_p["views"] = max(int(posts_by_id[pid].get("views") or 0), int(p.get("views") or 0))
+                    best_p["views"] = max(_safe_int(posts_by_id[pid].get("views")), _safe_int(p.get("views")))
                     posts_by_id[pid] = best_p
                 else:
-                    posts_by_id[pid] = dict(p)
-        merged["posts_list"] = sorted(posts_by_id.values(), key=lambda x: int(x.get("views") or 0), reverse=True)
-    elif len(new_posts) > 0:
-        merged["posts_list"] = new_posts
+                    p_copy = dict(p)
+                    p_copy["views"] = _safe_int(p.get("views"))
+                    posts_by_id[pid] = p_copy
+
+        merged_posts_list = sorted(posts_by_id.values(), key=lambda x: _safe_int(x.get("views")), reverse=True)
+        merged["posts_list"] = merged_posts_list
+
+        # Garante que total_views nunca seja menor que a soma dos posts salvos
+        sum_posts_views = sum(_safe_int(x.get("views")) for x in merged_posts_list)
+        merged["total_views"] = max(merged["total_views"], sum_posts_views)
+        merged["media_count"] = max(merged["media_count"], len(merged_posts_list))
     else:
-        merged["posts_list"] = old_posts
+        merged["posts_list"] = []
 
     # Preserva o horário real da última coleta válida se a conta tiver caído
-    old_ts = base_acc.get("metrics_updated_at", "")
-    new_ts = new_acc.get("metrics_updated_at", "")
+    old_ts = str(base_acc.get("metrics_updated_at") or "").strip()
+    new_ts = str(new_acc.get("metrics_updated_at") or "").strip()
     invalid_markers = ("", "—", "Sem coleta antes da queda")
-    if new_ts in invalid_markers and old_ts not in invalid_markers:
-        merged["metrics_updated_at"] = old_ts
-    elif new_ts not in invalid_markers:
+    if new_ts not in invalid_markers:
         merged["metrics_updated_at"] = new_ts
-    elif old_ts:
+    elif old_ts not in invalid_markers:
         merged["metrics_updated_at"] = old_ts
+    else:
+        merged["metrics_updated_at"] = old_ts or new_ts or "—"
 
     # Preserva o username real (nunca troca um @username válido por user_123456)
-    old_user = str(base_acc.get("username") or "")
-    new_user = str(new_acc.get("username") or "")
-    if new_user.startswith("user_") and old_user and not old_user.startswith("user_"):
+    old_user = str(base_acc.get("username") or "").strip()
+    new_user = str(new_acc.get("username") or "").strip()
+    if (not new_user or new_user.startswith("user_")) and old_user and not old_user.startswith("user_"):
         merged["username"] = old_user
 
     return merged
@@ -285,7 +363,7 @@ def merge_best_account_data(base_acc, new_acc):
 def get_env_accounts():
     """
     Lê as contas de ACCOUNTS_CONFIG_JSON e também mescla com quaisquer métricas
-    salvas em `contas_conectadas.json` ou `contas_monitoradas.json` da pasta do projeto.
+    salvas em `contas_conectadas.json` da pasta do projeto.
     """
     raw = os.environ.get("ACCOUNTS_CONFIG_JSON", "").strip()
     accounts_dict = {}
@@ -306,8 +384,9 @@ def get_env_accounts():
                 for uid, item in data.items():
                     if isinstance(item, dict):
                         item_copy = dict(item)
-                        item_copy["ig_user_id"] = str(item_copy.get("ig_user_id") or uid)
-                        accounts_dict[str(uid)] = item_copy
+                        uid_clean = str(item_copy.get("ig_user_id") or uid).strip()
+                        item_copy["ig_user_id"] = uid_clean
+                        accounts_dict[uid_clean] = item_copy
         except Exception as e:
             print(f"[ERRO] Falha ao ler ACCOUNTS_CONFIG_JSON: {e}", flush=True)
 
@@ -315,17 +394,20 @@ def get_env_accounts():
         try:
             c1_data = load_json(CODIGO1_ACCOUNTS_FILE, {})
             if isinstance(c1_data, dict):
-                for uid, item in c1_data.items():
-                    if isinstance(item, dict):
-                        uid_str = str(item.get("ig_user_id") or uid)
-                        if uid_str in accounts_dict:
-                            accounts_dict[uid_str] = merge_best_account_data(item, accounts_dict[uid_str])
-                            if not accounts_dict[uid_str].get("access_token") and item.get("access_token"):
-                                accounts_dict[uid_str]["access_token"] = item["access_token"]
-                        else:
-                            item_copy = dict(item)
-                            item_copy["ig_user_id"] = uid_str
-                            accounts_dict[uid_str] = item_copy
+                c1_accs = c1_data.get("accounts", c1_data if "last_global_sync_ts" not in c1_data else {})
+                if isinstance(c1_accs, dict):
+                    for uid, item in c1_accs.items():
+                        if isinstance(item, dict):
+                            uid_str = str(item.get("ig_user_id") or uid).strip()
+                            if uid_str in accounts_dict:
+                                token_backup = accounts_dict[uid_str].get("access_token") or item.get("access_token")
+                                accounts_dict[uid_str] = merge_best_account_data(item, accounts_dict[uid_str])
+                                if token_backup:
+                                    accounts_dict[uid_str]["access_token"] = token_backup
+                            else:
+                                item_copy = dict(item)
+                                item_copy["ig_user_id"] = uid_str
+                                accounts_dict[uid_str] = item_copy
         except Exception as e:
             print(f"[ERRO] Falha ao ler contas_conectadas.json: {e}", flush=True)
 
@@ -334,9 +416,8 @@ def get_env_accounts():
 
 def get_saved_state(force_redis=False):
     """
-    Carrega e mescla as fontes de histórico.
-    OTIMIZAÇÃO UPSTASH: Só faz requisição GET ao Upstash no cold start (primeira leitura)
-    ou se `force_redis=True` ou após expirar `REDIS_READ_TTL` (5 min).
+    Carrega e mescla todas as fontes de histórico (Upstash Redis, /tmp, JSON local e RAM).
+    Só marca `REDIS_BOOTSTRAPPED = True` se a leitura do Upstash realmente tiver sucesso!
     """
     global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED
 
@@ -348,9 +429,10 @@ def get_saved_state(force_redis=False):
         # 1. Dados vindos da configuração/ambiente ou Código 1
         env_accs = get_env_accounts()
         for uid, acc in env_accs.items():
+            uid_s = str(uid).strip()
             clean_acc = dict(acc)
             clean_acc.pop("access_token", None)
-            merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), clean_acc)
+            merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), clean_acc)
 
         # 2. Dados do arquivo contas_monitoradas.json na raiz do projeto (se existir)
         if os.path.exists(BUNDLED_MONITOR_FILE):
@@ -360,9 +442,10 @@ def get_saved_state(force_redis=False):
                 if isinstance(b_accs, dict):
                     for uid, acc in b_accs.items():
                         if isinstance(acc, dict):
+                            uid_s = str(acc.get("ig_user_id") or uid).strip()
                             acc_clean = dict(acc)
                             acc_clean.pop("access_token", None)
-                            merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc_clean)
+                            merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc_clean)
                 if float(bundled.get("last_global_sync_ts") or 0) > last_ts:
                     last_ts = float(bundled["last_global_sync_ts"])
                     last_str = bundled.get("last_global_sync_str", last_str)
@@ -371,18 +454,19 @@ def get_saved_state(force_redis=False):
         if os.path.exists(RUNTIME_ACCOUNTS_FILE):
             runtime = load_json(RUNTIME_ACCOUNTS_FILE, {})
             if isinstance(runtime, dict):
-                r_accs = runtime.get("accounts", {})
+                r_accs = runtime.get("accounts", runtime if "last_global_sync_ts" not in runtime else {})
                 if isinstance(r_accs, dict):
                     for uid, acc in r_accs.items():
                         if isinstance(acc, dict):
+                            uid_s = str(acc.get("ig_user_id") or uid).strip()
                             acc_clean = dict(acc)
                             acc_clean.pop("access_token", None)
-                            merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc_clean)
+                            merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc_clean)
                 if float(runtime.get("last_global_sync_ts") or 0) > last_ts:
                     last_ts = float(runtime["last_global_sync_ts"])
                     last_str = runtime.get("last_global_sync_str", last_str)
 
-        # 4. Dados persistentes do UPSTASH REDIS (Apenas se nunca carregou na instância ou expirou TTL)
+        # 4. Dados persistentes do UPSTASH REDIS
         now = time.time()
         should_query_redis = (
             is_upstash_configured()
@@ -390,29 +474,32 @@ def get_saved_state(force_redis=False):
         )
 
         if should_query_redis:
-            redis_state = load_state_from_upstash()
-            LAST_REDIS_FETCH_TS = now
-            REDIS_BOOTSTRAPPED = True
-            if isinstance(redis_state, dict):
-                redis_accs = redis_state.get("accounts", {})
-                if isinstance(redis_accs, dict):
-                    for uid, acc in redis_accs.items():
-                        if isinstance(acc, dict):
-                            acc_clean = dict(acc)
-                            acc_clean.pop("access_token", None)
-                            merged_accounts[str(uid)] = merge_best_account_data(
-                                merged_accounts.get(str(uid), {}), acc_clean
-                            )
-                if float(redis_state.get("last_global_sync_ts") or 0) > last_ts:
-                    last_ts = float(redis_state["last_global_sync_ts"])
-                    last_str = redis_state.get("last_global_sync_str", last_str)
+            ok_redis, redis_state = load_state_from_upstash()
+            if ok_redis:
+                LAST_REDIS_FETCH_TS = now
+                REDIS_BOOTSTRAPPED = True
+                if isinstance(redis_state, dict):
+                    redis_accs = redis_state.get("accounts", {})
+                    if isinstance(redis_accs, dict):
+                        for uid, acc in redis_accs.items():
+                            if isinstance(acc, dict):
+                                uid_s = str(acc.get("ig_user_id") or uid).strip()
+                                acc_clean = dict(acc)
+                                acc_clean.pop("access_token", None)
+                                merged_accounts[uid_s] = merge_best_account_data(
+                                    merged_accounts.get(uid_s, {}), acc_clean
+                                )
+                    if float(redis_state.get("last_global_sync_ts") or 0) > last_ts:
+                        last_ts = float(redis_state["last_global_sync_ts"])
+                        last_str = redis_state.get("last_global_sync_str", last_str)
 
         # 5. Cache em memória RAM
         for uid, acc in MEMORY_CACHE_ACCOUNTS.items():
             if isinstance(acc, dict):
-                merged_accounts[str(uid)] = merge_best_account_data(merged_accounts.get(str(uid), {}), acc)
+                uid_s = str(uid).strip()
+                merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc)
 
-        # Atualiza a memória RAM e o /tmp com o melhor estado consolidado
+        # Atualiza a memória RAM com o melhor estado consolidado
         for uid, acc in merged_accounts.items():
             MEMORY_CACHE_ACCOUNTS[str(uid)] = acc
 
@@ -426,14 +513,16 @@ def get_saved_state(force_redis=False):
             "accounts": sorted_accs
         }
 
-        if should_query_redis:
+        if should_query_redis and REDIS_BOOTSTRAPPED:
             save_json(RUNTIME_ACCOUNTS_FILE, result_state)
+            if RUNTIME_ACCOUNTS_FILE != BUNDLED_MONITOR_FILE and os.access(BASE_DIR, os.W_OK):
+                save_json(BUNDLED_MONITOR_FILE, result_state)
 
         return result_state
 
 
 def save_current_state(state_data):
-    """Salva o estado simultaneamente na Memória, no /tmp, no disco local e no Upstash Redis (1 comando SET)."""
+    """Salva o estado simultaneamente na Memória, no /tmp, no disco local e no Upstash Redis."""
     global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR
 
     with ACCOUNTS_LOCK:
@@ -444,14 +533,15 @@ def save_current_state(state_data):
 
             if isinstance(state_data.get("accounts"), dict):
                 for uid, acc in state_data["accounts"].items():
+                    uid_s = str(uid).strip()
                     clean_acc = dict(acc)
                     clean_acc.pop("access_token", None)
-                    MEMORY_CACHE_ACCOUNTS[str(uid)] = merge_best_account_data(
-                        MEMORY_CACHE_ACCOUNTS.get(str(uid), {}), clean_acc
+                    MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
+                        MEMORY_CACHE_ACCOUNTS.get(uid_s, {}), clean_acc
                     )
                 state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
 
-        # 1. Salva no Upstash Redis (1 único comando SET)
+        # 1. Salva no Upstash Redis (com trava anti-sobrescrita a frio)
         if is_upstash_configured():
             save_state_to_upstash(state_data)
 
@@ -607,16 +697,15 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
     """
     Busca os números atuais na Meta e NUNCA apaga nem reduz para zero os seguidores,
     visualizações totais ou lista de posts que já estavam salvos anteriormente.
-    (Não faz chamadas individuais ao Redis aqui dentro — tudo é salvo em lote ao final).
     """
-    ig_user_id = str(acc_config.get("ig_user_id", ""))
+    ig_user_id = str(acc_config.get("ig_user_id", "")).strip()
     access_token = acc_config.get("access_token", "")
     now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
 
     previous_best = merge_best_account_data(acc_config, last_json_entry)
-    prev_followers = int(previous_best.get("followers_count") or 0)
-    prev_views = int(previous_best.get("total_views") or 0)
-    prev_media_count = int(previous_best.get("media_count") or 0)
+    prev_followers = _safe_int(previous_best.get("followers_count"))
+    prev_views = _safe_int(previous_best.get("total_views"))
+    prev_media_count = _safe_int(previous_best.get("media_count"))
     prev_posts_list = previous_best.get("posts_list") if isinstance(previous_best.get("posts_list"), list) else []
     prev_updated_at = previous_best.get("metrics_updated_at") or "Sem coleta antes da queda"
 
@@ -662,9 +751,9 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                 if p_data.get("username"):
                     current["username"] = p_data["username"]
                 if "followers_count" in p_data and p_data["followers_count"] is not None:
-                    fetched_followers = int(p_data["followers_count"])
+                    fetched_followers = _safe_int(p_data["followers_count"])
                 if "media_count" in p_data and p_data["media_count"] is not None:
-                    fetched_media_count = int(p_data["media_count"])
+                    fetched_media_count = _safe_int(p_data["media_count"])
                 if fetched_followers is not None:
                     break
             else:
@@ -696,7 +785,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         current["followers_count"] = prev_followers
         current["total_views"] = prev_views
         current["media_count"] = prev_media_count
-        current["posts_list"] = sorted(prev_posts_list, key=lambda x: x.get("views", 0), reverse=True)
+        current["posts_list"] = sorted(prev_posts_list, key=lambda x: _safe_int(x.get("views")), reverse=True)
         current["metrics_updated_at"] = prev_updated_at
         current.pop("access_token", None)
         return current
@@ -754,7 +843,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
             media_fetch_error = True
 
     prev_views_by_post_id = {
-        str(p.get("id")): int(p.get("views") or 0)
+        str(p.get("id")): _safe_int(p.get("views"))
         for p in prev_posts_list if isinstance(p, dict) and p.get("id")
     }
 
@@ -827,20 +916,16 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
             "timestamp": ts_fmt
         })
 
-    posts_ranked.sort(key=lambda x: x.get("views", 0), reverse=True)
+    posts_ranked.sort(key=lambda x: _safe_int(x.get("views")), reverse=True)
 
     current = merge_best_account_data(
         previous_best,
         {
             **current,
             "posts_list": posts_ranked if len(posts_ranked) > 0 else prev_posts_list,
-            "followers_count": fetched_followers if (fetched_followers is not None and (fetched_followers > 0 or prev_followers == 0)) else prev_followers,
+            "followers_count": max(fetched_followers or 0, prev_followers),
             "total_views": max(total_views, prev_views),
-            "media_count": (
-                fetched_media_count
-                if (fetched_media_count is not None and (fetched_media_count > 0 or prev_media_count == 0))
-                else (len(posts_ranked) if len(posts_ranked) > 0 else prev_media_count)
-            ),
+            "media_count": max(fetched_media_count or 0, len(posts_ranked), prev_media_count),
             "metrics_updated_at": now_str if not media_fetch_error else prev_updated_at
         }
     )
@@ -855,10 +940,10 @@ def refresh_all_accounts_to_json():
     tudo no Upstash Redis com 1 único comando SET ao final.
     """
     with SYNC_LOCK:
-        env_accounts = get_env_accounts()
-        # Garante que temos a base do Redis caso ainda não tenha sido carregada nesta instância
+        # 1. Obriga a carregar do Upstash primeiro se ainda não tiver feito bootstrap com sucesso
         saved_state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
         saved_accounts = saved_state.get("accounts", {}) if isinstance(saved_state, dict) else {}
+        env_accounts = get_env_accounts()
 
         if not env_accounts:
             if saved_accounts:
@@ -874,20 +959,21 @@ def refresh_all_accounts_to_json():
                 acc_id: pool.submit(
                     fetch_account_current_metrics,
                     env_accounts[acc_id],
-                    saved_accounts.get(acc_id, {})
+                    saved_accounts.get(str(acc_id), {})
                 )
                 for acc_id in acc_ids
             }
             for acc_id, fut in futures.items():
+                uid_s = str(acc_id).strip()
                 try:
                     updated_acc = fut.result()
-                    new_accounts_map[acc_id] = merge_best_account_data(
-                        saved_accounts.get(acc_id, {}), updated_acc
+                    new_accounts_map[uid_s] = merge_best_account_data(
+                        saved_accounts.get(uid_s, {}), updated_acc
                     )
                 except Exception as e:
-                    print(f"[AVISO MÉTRICAS] Falha ao atualizar conta {acc_id}: {e}", flush=True)
-                    if acc_id in saved_accounts:
-                        new_accounts_map[acc_id] = saved_accounts[acc_id]
+                    print(f"[AVISO MÉTRICAS] Falha ao atualizar conta {uid_s}: {e}", flush=True)
+                    if uid_s in saved_accounts:
+                        new_accounts_map[uid_s] = saved_accounts[uid_s]
 
         sorted_accounts_map = sort_accounts_by_views_desc(new_accounts_map)
 
@@ -904,13 +990,14 @@ def refresh_all_accounts_to_json():
 
 
 # ==============================================================================
-# THREAD LOCAL DE 5 EM 5 MINUTOS (SEM GASTAR COMANDOS DO REDIS À TOA)
+# THREAD LOCAL DE 5 EM 5 MINUTOS (AGUARDA BOOT PARA EVITAR RACE CONDITION)
 # ==============================================================================
 
 def background_5min_loop():
+    # Aguarda 5 segundos no boot para não disputar corrida com a primeira requisição HTTP
+    time.sleep(5)
     while True:
         try:
-            # Checa primeiro o timestamp em memória (0 comandos no Redis)
             if not REDIS_BOOTSTRAPPED:
                 state = get_saved_state(force_redis=True)
                 last_ts = state.get("last_global_sync_ts", 0)
@@ -1039,9 +1126,13 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            {% if upstash_active %}
+            {% if upstash_active and redis_bootstrapped %}
             <div class="badge success" style="font-size:0.82rem; padding:8px 12px;">
-                ☁️ Banco Persistente: <b>Upstash Redis Ativo (Modo Econômico)</b>
+                ☁️ Banco Persistente: <b>Upstash Redis Sincronizado</b>
+            </div>
+            {% elif upstash_active %}
+            <div class="badge warning" style="font-size:0.82rem; padding:8px 12px;">
+                ⚠️ Upstash Configurado (Aguardando Conexão...)
             </div>
             {% else %}
             <div class="badge warning" style="font-size:0.82rem; padding:8px 12px;">
@@ -1249,7 +1340,8 @@ HTML_TEMPLATE = r"""
 @app.route("/", methods=["GET"])
 @requires_auth
 def index():
-    state = get_saved_state(force_redis=False)
+    # Se ainda não inicializou do Upstash nesta instância, força a leitura primeiro
+    state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     last_ts = state.get("last_global_sync_ts", 0)
     accounts = state.get("accounts", {})
 
@@ -1259,8 +1351,8 @@ def index():
     accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
     last_sync_str = state.get("last_global_sync_str", "—")
 
-    total_followers = sum(int(acc.get("followers_count") or 0) for acc in accounts.values())
-    total_views = sum(int(acc.get("total_views") or 0) for acc in accounts.values())
+    total_followers = sum(_safe_int(acc.get("followers_count")) for acc in accounts.values())
+    total_views = sum(_safe_int(acc.get("total_views")) for acc in accounts.values())
 
     return render_template_string(
         HTML_TEMPLATE,
@@ -1268,7 +1360,8 @@ def index():
         last_sync=last_sync_str,
         total_followers=total_followers,
         total_views=total_views,
-        upstash_active=is_upstash_configured()
+        upstash_active=is_upstash_configured(),
+        redis_bootstrapped=REDIS_BOOTSTRAPPED
     )
 
 
@@ -1287,15 +1380,19 @@ def export_snapshot():
     com as últimas métricas e posts coletados.
     """
     env_accs = get_env_accounts()
-    state = get_saved_state(force_redis=False)
+    state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     saved_accs = state.get("accounts", {})
 
     export_dict = {}
-    for uid, env_item in env_accs.items():
-        merged = merge_best_account_data(env_item, saved_accs.get(uid, {}))
+    all_uids = set(env_accs.keys()) | set(saved_accs.keys())
+    for uid in all_uids:
+        uid_s = str(uid).strip()
+        env_item = env_accs.get(uid_s, {})
+        saved_item = saved_accs.get(uid_s, {})
+        merged = merge_best_account_data(env_item, saved_item)
         if env_item.get("access_token"):
             merged["access_token"] = env_item["access_token"]
-        export_dict[uid] = merged
+        export_dict[uid_s] = merged
 
     return jsonify(export_dict)
 
@@ -1317,7 +1414,7 @@ def cron_sync():
     state = refresh_all_accounts_to_json()
     return jsonify({
         "ok": True,
-        "upstash_persisted": is_upstash_configured(),
+        "upstash_persisted": is_upstash_configured() and REDIS_BOOTSTRAPPED,
         "updated_at": state.get("last_global_sync_str"),
         "accounts_count": len(state.get("accounts", {}))
     })
