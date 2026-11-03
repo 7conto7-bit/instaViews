@@ -3,6 +3,7 @@ import os
 import hmac
 import json
 import time
+import struct
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -45,9 +46,13 @@ SYNC_LOCK = threading.Lock()
 
 # Cache em memória do processo
 MEMORY_CACHE_ACCOUNTS = {}
+MEMORY_DELETED_IDS = set()
 MEMORY_LAST_SYNC_TS = 0.0
 MEMORY_LAST_SYNC_STR = "Ainda não sincronizado"
 LAST_REDIS_FETCH_TS = 0.0
+
+# Cache em memória para durações de vídeos já descobertas (media_id -> float seconds)
+MEDIA_DURATION_CACHE = {}
 
 # Flag que garante que o estado existente no Upstash foi lido com sucesso nesta instância
 REDIS_BOOTSTRAPPED = False
@@ -87,12 +92,25 @@ def format_rate_br(val):
         return str(val)
 
 
+def format_duration_sec(val):
+    """Formata a duração do vídeo em segundos (ex: '14s' ou '1m12s (72s)')."""
+    try:
+        sec = float(val or 0)
+        if sec <= 0:
+            return "— s"
+        sec_int = int(round(sec))
+        return f"{sec_int}s"
+    except Exception:
+        return "— s"
+
+
 app.jinja_env.filters["fmt_num"] = format_number_br
 app.jinja_env.filters["fmt_rate"] = format_rate_br
+app.jinja_env.filters["fmt_dur"] = format_duration_sec
 
 
 # ==============================================================================
-# UTILITÁRIOS DE CONVERSÃO, TIMESTAMPS (CORREÇÃO UTC -> BRT) E VELOCIDADE
+# UTILITÁRIOS DE CONVERSÃO, EXTRAÇÃO DE DURAÇÃO MP4, TIMESTAMPS E VELOCIDADE
 # ==============================================================================
 
 def _safe_int(val):
@@ -117,6 +135,103 @@ def _safe_float(val):
         return 0.0
 
 
+def _parse_mp4_mvhd_duration(data_bytes):
+    """
+    Procura a assinatura do átomo 'mvhd' nos bytes iniciais/finais de um arquivo MP4
+    e extrai a duração exata em segundos a partir de timescale e duration.
+    """
+    if not data_bytes:
+        return 0.0
+    idx = 0
+    while True:
+        pos = data_bytes.find(b"mvhd", idx)
+        if pos == -1 or pos + 24 > len(data_bytes):
+            break
+        version = data_bytes[pos + 4]
+        try:
+            if version == 0 and pos + 24 <= len(data_bytes):
+                timescale, duration = struct.unpack(">II", data_bytes[pos + 16:pos + 24])
+                if timescale > 0 and 0 < (duration / timescale) < 7200:
+                    return round(duration / timescale, 1)
+            elif version == 1 and pos + 36 <= len(data_bytes):
+                timescale, duration = struct.unpack(">IQ", data_bytes[pos + 24:pos + 36])
+                if timescale > 0 and 0 < (duration / timescale) < 7200:
+                    return round(duration / timescale, 1)
+        except Exception:
+            pass
+        idx = pos + 4
+    return 0.0
+
+
+def _probe_video_duration_seconds(media_item):
+    """
+    Obtém a duração em segundos de um Reel/Vídeo sem precisar baixar o vídeo inteiro:
+    1) Verifica se já está em cache por ID.
+    2) Verifica se o objeto já traz `video_duration` / `duration_sec`.
+    3) Faz uma requisição HTTP Range (primeiros 64 KB) na `media_url` do vídeo da CDN do Instagram
+       para ler o cabeçalho binário `mvhd` do MP4. Se o `moov` estiver no final do arquivo,
+       lê os últimos 64 KB.
+    """
+    if not isinstance(media_item, dict):
+        return 0.0
+
+    mid = str(media_item.get("id") or "").strip()
+    if mid and mid in MEDIA_DURATION_CACHE and MEDIA_DURATION_CACHE[mid] > 0:
+        return MEDIA_DURATION_CACHE[mid]
+
+    for key in ("duration_sec", "video_duration", "duration"):
+        val = _safe_float(media_item.get(key))
+        if val > 0:
+            if mid:
+                MEDIA_DURATION_CACHE[mid] = round(val, 1)
+            return round(val, 1)
+
+    media_type = str(media_item.get("media_type") or media_item.get("media_product_type") or "").upper()
+    if "IMAGE" in media_type or "CAROUSEL" in media_type:
+        return 0.0
+
+    media_url = (media_item.get("media_url") or "").strip()
+    if not media_url:
+        return 0.0
+
+    try:
+        # Tenta os primeiros 64 KB (onde fica o átomo moov/mvhd em 99% dos vídeos de streaming da Meta)
+        r = requests.get(
+            media_url,
+            headers={"Range": "bytes=0-65535", "User-Agent": "Mozilla/5.0"},
+            timeout=5,
+            stream=True
+        )
+        chunk = r.raw.read(65536) if hasattr(r, "raw") else r.content[:65536]
+        r.close()
+        dur = _parse_mp4_mvhd_duration(chunk)
+        if dur > 0:
+            if mid:
+                MEDIA_DURATION_CACHE[mid] = dur
+            return dur
+
+        # Fallback: caso o átomo moov esteja no final do MP4, busca os últimos 65 KB
+        content_range = r.headers.get("Content-Range", "")
+        if "/" in content_range:
+            total_size = _safe_int(content_range.split("/")[-1])
+            if total_size > 65536:
+                start_byte = max(0, total_size - 65536)
+                r_tail = requests.get(
+                    media_url,
+                    headers={"Range": f"bytes={start_byte}-{total_size - 1}", "User-Agent": "Mozilla/5.0"},
+                    timeout=5
+                )
+                dur_tail = _parse_mp4_mvhd_duration(r_tail.content)
+                if dur_tail > 0:
+                    if mid:
+                        MEDIA_DURATION_CACHE[mid] = dur_tail
+                    return dur_tail
+    except Exception:
+        pass
+
+    return 0.0
+
+
 def _parse_br_datetime_to_ts(dt_str):
     if not dt_str or not isinstance(dt_str, str):
         return None
@@ -134,15 +249,13 @@ def _parse_ig_post_timestamp_to_brt(ts_str):
     """
     Corrige o timestamp dos posts do Instagram:
     A Graph API retorna timestamps em UTC (ex: '2026-11-03T17:53:00+0000' ou '2026-11-03 17:53').
-    Converte com precisão para o fuso de Brasília (BRT / UTC-3) e evita que posts recém-publicados
-    pareçam estar '3 horas no futuro'.
+    Converte com precisão para o fuso de Brasília (BRT / UTC-3).
     """
     if not ts_str or not isinstance(ts_str, str):
         return None, "—"
     s = ts_str.strip()
     now_ts = time.time()
 
-    # Caso 1: Formato ISO completo vindo direto da API da Meta
     if "T" in s or "+" in s:
         try:
             clean_iso = s.replace("+0000", "+00:00").replace("Z", "+00:00")
@@ -154,16 +267,12 @@ def _parse_ig_post_timestamp_to_brt(ts_str):
         except Exception:
             pass
 
-    # Caso 2: Formato curto salvo anteriormente ('YYYY-MM-DD HH:MM')
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt_naive = datetime.strptime(s[:19].strip(), fmt)
-            # No código anterior, `ts_raw[:16].replace("T", " ")` salvava em UTC sem timezone.
-            # Assumimos UTC para traduzir corretamente para BRT:
             dt_utc = dt_naive.replace(tzinfo=timezone.utc)
             dt_brt = dt_utc.astimezone(BRT)
             ts_val = dt_brt.timestamp()
-            # Fallback de segurança caso algum registro já estivesse em BRT
             if ts_val > now_ts + 600:
                 dt_brt = dt_naive.replace(tzinfo=BRT)
                 ts_val = dt_brt.timestamp()
@@ -171,7 +280,6 @@ def _parse_ig_post_timestamp_to_brt(ts_str):
         except Exception:
             continue
 
-    # Caso 3: Formato BR ('DD/MM/YYYY HH:MM')
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m %H:%M"):
         try:
             dt_brt = datetime.strptime(s, fmt).replace(tzinfo=BRT)
@@ -200,10 +308,6 @@ def _format_age_human(seconds):
 
 
 def _merge_views_history(old_hist, new_hist, current_views=0, current_ts=None):
-    """
-    Mescla o histórico de coletas (timestamp + total_views) preservando até 288 pontos (24h).
-    Garante que o total de views na linha do tempo nunca regrida para zero.
-    """
     by_bucket = {}
     for src in (old_hist, new_hist):
         if not isinstance(src, list):
@@ -214,7 +318,7 @@ def _merge_views_history(old_hist, new_hist, current_views=0, current_ts=None):
             ts = _safe_float(item.get("ts"))
             v = _safe_int(item.get("views"))
             if ts > 0 and v >= 0:
-                bucket = int(ts // 30)  # agrupa leituras dentro da mesma janela de 30s
+                bucket = int(ts // 30)
                 if bucket not in by_bucket or v > by_bucket[bucket]["views"]:
                     by_bucket[bucket] = {"ts": round(ts, 2), "views": v}
 
@@ -225,25 +329,18 @@ def _merge_views_history(old_hist, new_hist, current_views=0, current_ts=None):
 
     ordered = sorted(by_bucket.values(), key=lambda x: x["ts"])
 
-    # Garante monotonicidade (nunca deixa um ponto posterior ter menos views que o anterior)
     running_max = 0
     cleaned = []
     for pt in ordered:
         running_max = max(running_max, _safe_int(pt.get("views")))
         cleaned.append({"ts": pt["ts"], "views": running_max})
 
-    # Mantém últimas 24h (ou no máximo 288 pontos de 5 min)
     if len(cleaned) > 288:
         cleaned = cleaned[-288:]
     return cleaned
 
 
 def _compute_account_velocity_rates(acc_dict):
-    """
-    Calcula `views_per_min` e `views_per_hour` APENAS com base nos dados atuais
-    (variação real entre os snapshots recentes de coleta em `views_history`),
-    ignorando views antigas acumuladas antes do monitoramento atual.
-    """
     if not isinstance(acc_dict, dict):
         return 0.0, 0.0
 
@@ -259,7 +356,6 @@ def _compute_account_velocity_rates(acc_dict):
     if latest_ts <= 0 or (now_ts - latest_ts) > 7200:
         return 0.0, 0.0
 
-    # 1. VIEWS / MIN ATUAL:
     ref_min_pt = None
     for pt in reversed(hist[:-1]):
         dt_sec = latest_ts - _safe_float(pt.get("ts"))
@@ -275,7 +371,6 @@ def _compute_account_velocity_rates(acc_dict):
     if 30 <= dt_min_sec <= 2700 and dv_min > 0:
         current_vpm = dv_min / (dt_min_sec / 60.0)
 
-    # 2. VIEWS / HORA ATUAL:
     points_last_hour = [
         pt for pt in hist[:-1]
         if 60 <= (latest_ts - _safe_float(pt.get("ts"))) <= 3900
@@ -299,19 +394,10 @@ def _compute_account_velocity_rates(acc_dict):
 
 
 # ==============================================================================
-# MOTOR DE INTELIGÊNCIA OPERACIONAL E ALOCAÇÃO DE TRAÇÃO (NOVO!)
+# MOTOR DE INTELIGÊNCIA OPERACIONAL E ALOCAÇÃO DE TRAÇÃO
 # ==============================================================================
 
 def _analyze_account_intelligence(acc_dict):
-    """
-    Motor avançado de decisão para operação multicontas de Reels:
-    1. Calcula Índice de Atividade (Atual vs Recorde) e Aceleração Instantânea (Curto vs Médio Prazo).
-    2. Corrige timestamps UTC -> BRT de cada post e mede a idade do último lote postado.
-    3. Classifica cada vídeo (Megaviral, Hit, Acelerando, Em Maturação ou Flat/Morte Súbita).
-    4. Descobre a Janela de Horário de Ouro da conta com base nos hits históricos e no Redis.
-    5. Gera a Recomendação Operacional Exata (Surfar Tração, Aguardar Cooldown Anti-Canibalização,
-       Lote de Teste de Reativação ou Pausar Conta Zumbi).
-    """
     if not isinstance(acc_dict, dict):
         return {}
 
@@ -326,13 +412,10 @@ def _analyze_account_intelligence(acc_dict):
     followers = _safe_int(acc_dict.get("followers_count"))
     media_count = _safe_int(acc_dict.get("media_count"))
 
-    # 1. Índice de Atividade (0% a 100% do Recorde Histórico Horário)
     activity_index_pct = 0.0
     if peak_hour > 0:
         activity_index_pct = round(min(100.0, (v_hour / peak_hour) * 100.0), 1)
 
-    # 2. Taxa de Aceleração Instantânea (Views/Min atual projetado vs Views/Hora atual)
-    # Se > 1.15x, a conta está ganhando velocidade agora. Se < 0.80x, está desacelerando.
     hourly_avg_vpm = (v_hour / 60.0) if v_hour > 0 else 0.0
     accel_ratio = round(v_min / hourly_avg_vpm, 2) if hourly_avg_vpm >= 1.0 else (1.0 if v_min > 0 else 0.0)
 
@@ -349,7 +432,6 @@ def _analyze_account_intelligence(acc_dict):
         trend_label = f"⚡ Estável ({accel_ratio:.1f}x)"
         trend_color = "#38bdf8"
 
-    # 3. Análise profunda da lista de Posts (Idade BRT, Velocidade por Post, Morte Súbita e Hits)
     posts = acc_dict.get("posts_list") if isinstance(acc_dict.get("posts_list"), list) else []
     newest_post_ts = None
     recent_batch_count_3h = 0
@@ -378,7 +460,6 @@ def _analyze_account_intelligence(acc_dict):
         age_hours = (age_sec / 3600.0) if age_sec else None
         p["age_human"] = _format_age_human(age_sec) if age_sec else "—"
 
-        # Contabiliza horário de publicação dos vídeos de sucesso (>= 10k views) para achar a Janela de Ouro
         if p_ts and p_views >= 10000:
             hr_brt = datetime.fromtimestamp(p_ts, tz=BRT).hour
             winning_hours_counter[hr_brt] += (3 if p_views >= 100000 else 1)
@@ -386,11 +467,10 @@ def _analyze_account_intelligence(acc_dict):
         if p_ts:
             if newest_post_ts is None or p_ts > newest_post_ts:
                 newest_post_ts = p_ts
-            if age_sec <= 10800:  # últimos 180 min (3h)
+            if age_sec <= 10800:
                 recent_batch_count_3h += 1
                 recent_batch_views_3h += p_views
 
-        # Velocidade média vitalícia do post e diagnóstico individual (Morte Súbita vs Tração)
         gain_recent = _safe_int(p.get("recent_views_gain"))
         if p_views >= 100000:
             p["diag_label"] = "🔥 Megaviral (+100k)"
@@ -422,7 +502,6 @@ def _analyze_account_intelligence(acc_dict):
     top_post_share_pct = round((top_post_views / total_views) * 100.0, 1) if total_views > 0 else 0.0
     followers_per_1k_views = round((followers / total_views) * 1000.0, 2) if total_views > 0 else 0.0
 
-    # 4. Descoberta do Horário de Ouro (Janela de Pico da Conta em BRT)
     best_window_str = "Sem dados suficientes"
     if winning_hours_counter:
         best_hr = winning_hours_counter.most_common(1)[0][0]
@@ -432,14 +511,12 @@ def _analyze_account_intelligence(acc_dict):
     elif total_listed_posts > 0:
         best_window_str = "Em calibração (testar 11h / 18h)"
 
-    # 5. Tempo desde o último post/lote na conta
     mins_since_last_post = None
     last_post_age_str = "Sem posts"
     if newest_post_ts:
         mins_since_last_post = max(0, int((now_ts - newest_post_ts) // 60))
         last_post_age_str = f"há {_format_age_human(now_ts - newest_post_ts)}"
 
-    # 6. MOTOR DE DECISÃO: QUANDO E ONDE POSTAR O PRÓXIMO LOTE
     action_code = "WAIT"
     action_badge = "info"
     action_title = "AGUARDAR"
@@ -463,7 +540,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = -50
         can_post_now = False
     elif total_listed_posts >= 15 and total_views < 15000 and v_min < 3.0:
-        # Conta Zumbi / Shadowban de alcance (ex: @floriindadona, @donaflloriinda, @donna_fllorinda)
         action_code = "PAUSE_ZOMBIE"
         action_badge = "error"
         action_title = "🛑 PAUSAR 48H (CONTA TRAVADA)"
@@ -474,7 +550,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = 5
         can_post_now = False
     elif mins_since_last_post is not None and mins_since_last_post < 120:
-        # Lote recém-postado há menos de 2 horas -> TRAVA ANTI-CANIBALIZAÇÃO!
         wait_left = max(15, 120 - mins_since_last_post)
         if v_min >= 50 or recent_batch_views_3h >= 1500:
             action_code = "COOLDOWN_HOT"
@@ -496,7 +571,6 @@ def _analyze_account_intelligence(acc_dict):
             priority_score = 40
         can_post_now = False
     elif v_min >= 80 or (v_hour >= 4500 and activity_index_pct >= 55):
-        # CONTA QUENTE E JÁ PASSOU DO COOLDOWN DE 2H -> SURFAR TRAÇÃO AGORA!
         action_code = "SURF_TRACTION"
         action_badge = "success"
         action_title = "🔥 SURFAR TRAÇÃO (POSTAR LOTE AGORA)"
@@ -508,7 +582,6 @@ def _analyze_account_intelligence(acc_dict):
         can_post_now = True
         recommended_batch_size = 6
     elif v_min >= 25 or (total_views >= 300000 and v_min >= 10):
-        # Conta com tração moderada ou conta grande esfriando (ex: @florindaadonaa)
         if activity_index_pct < 25 and total_views >= 500000:
             action_code = "REACTIVATE_CHAMPION"
             action_badge = "warning"
@@ -575,7 +648,7 @@ def _parse_ig_post_timestamp_to_ts_and_str(raw_ts):
 
 
 # ==============================================================================
-# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (COM RETRY E PROTEÇÃO ANTI-SOBRESCRITA)
+# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (COM RETRY E LISTA DE EXCLUÍDAS)
 # ==============================================================================
 
 def is_upstash_configured():
@@ -583,10 +656,6 @@ def is_upstash_configured():
 
 
 def upstash_command(*args, retries=3):
-    """
-    Executa um único comando Redis via API REST do Upstash com retry automático.
-    Retorna uma tupla: (sucesso_http: bool, resultado: any)
-    """
     if not is_upstash_configured():
         return False, None
 
@@ -618,10 +687,6 @@ def upstash_command(*args, retries=3):
 
 
 def load_state_from_upstash():
-    """
-    Carrega o estado global salvo no Upstash Redis usando 1 comando (GET).
-    Retorna: (leitura_concluida_com_sucesso: bool, dados_do_estado: dict)
-    """
     if not is_upstash_configured():
         return False, {}
 
@@ -648,11 +713,10 @@ def load_state_from_upstash():
 
 def save_state_to_upstash(state_data):
     """
-    Salva o estado completo no Upstash Redis usando 1 comando (SET).
-    PROTEÇÃO CRÍTICA: Nunca sobrescreve o Upstash se a instância atual ainda não
-    tiver conseguido ler o estado anterior do Upstash (evita zerar contas no cold start).
+    Salva o estado completo no Upstash Redis usando 1 comando (SET),
+    respeitando as contas removidas (`deleted_ids`).
     """
-    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR
+    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS
     if not is_upstash_configured() or not isinstance(state_data, dict):
         return False
 
@@ -661,30 +725,41 @@ def save_state_to_upstash(state_data):
             ok_read, remote_state = load_state_from_upstash()
             if not ok_read:
                 print(
-                    "[PROTEÇÃO ANTI-ZERAMENTO] Abortando escrita no Upstash pois a leitura prévia falhou. "
-                    "Isso protege os dados históricos no Redis contra sobrescrita a frio.",
+                    "[PROTEÇÃO ANTI-ZERAMENTO] Abortando escrita no Upstash pois a leitura prévia falhou.",
                     flush=True
                 )
                 return False
 
-            remote_accs = remote_state.get("accounts", {}) if isinstance(remote_state, dict) else {}
-            if isinstance(remote_accs, dict):
-                for r_uid, r_acc in remote_accs.items():
-                    if isinstance(r_acc, dict):
-                        uid_s = str(r_uid)
-                        MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
-                            r_acc, MEMORY_CACHE_ACCOUNTS.get(uid_s, {})
-                        )
-            if float(remote_state.get("last_global_sync_ts") or 0) > MEMORY_LAST_SYNC_TS:
-                MEMORY_LAST_SYNC_TS = float(remote_state["last_global_sync_ts"])
-                MEMORY_LAST_SYNC_STR = remote_state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR)
+            if isinstance(remote_state, dict):
+                for d_id in remote_state.get("deleted_ids", []):
+                    MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+                remote_accs = remote_state.get("accounts", {})
+                if isinstance(remote_accs, dict):
+                    for r_uid, r_acc in remote_accs.items():
+                        uid_s = str(r_uid).strip()
+                        if uid_s in MEMORY_DELETED_IDS:
+                            continue
+                        if isinstance(r_acc, dict):
+                            MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
+                                r_acc, MEMORY_CACHE_ACCOUNTS.get(uid_s, {})
+                            )
+                if float(remote_state.get("last_global_sync_ts") or 0) > MEMORY_LAST_SYNC_TS:
+                    MEMORY_LAST_SYNC_TS = float(remote_state["last_global_sync_ts"])
+                    MEMORY_LAST_SYNC_STR = remote_state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR)
 
             REDIS_BOOTSTRAPPED = True
+
+        for d_id in state_data.get("deleted_ids", []):
+            MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+        for d_id in list(MEMORY_DELETED_IDS):
+            MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
 
         new_accs = state_data.get("accounts", {}) if isinstance(state_data.get("accounts"), dict) else {}
         cleaned_accs = {}
 
-        all_uids = set(MEMORY_CACHE_ACCOUNTS.keys()) | set(str(k) for k in new_accs.keys())
+        all_uids = (set(MEMORY_CACHE_ACCOUNTS.keys()) | set(str(k) for k in new_accs.keys())) - MEMORY_DELETED_IDS
         for uid_str in all_uids:
             mem_acc = MEMORY_CACHE_ACCOUNTS.get(uid_str, {})
             inc_acc = new_accs.get(uid_str, {})
@@ -704,12 +779,14 @@ def save_state_to_upstash(state_data):
                 if (state_data.get("last_global_sync_str") and state_data.get("last_global_sync_str") != "Ainda não sincronizado")
                 else (MEMORY_LAST_SYNC_STR or "—")
             ),
+            "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "accounts": sorted_accs
         }
 
         ok_set, _ = upstash_command("SET", REDIS_STATE_KEY, json.dumps(state_to_save, ensure_ascii=False))
         if ok_set:
             state_data["accounts"] = sorted_accs
+            state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
             LAST_REDIS_FETCH_TS = time.time()
             REDIS_BOOTSTRAPPED = True
             return True
@@ -734,7 +811,6 @@ def load_json(filepath, default):
 
 
 def save_json(filepath, data):
-    """Sobrescreve o arquivo .json de forma atômica."""
     tmp_path = f"{filepath}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -749,10 +825,6 @@ def save_json(filepath, data):
 
 
 def sort_accounts_by_views_desc(accounts_dict):
-    """
-    Ordena as contas colocando as com MAIS visualizações totais no topo
-    e as com MENOS visualizações para baixo.
-    """
     if not isinstance(accounts_dict, dict):
         return {}
     sorted_items = sorted(
@@ -767,12 +839,6 @@ def sort_accounts_by_views_desc(accounts_dict):
 
 
 def merge_best_account_data(base_acc, new_acc):
-    """
-    Combina duas versões dos dados de uma mesma conta garantindo que NUNCA
-    se percam seguidores, visualizações, recordes de velocidade ou lista de posts
-    caso uma fonte esteja zerada. Usa sempre max() entre o histórico salvo e a leitura nova.
-    Também rastreia o ganho recente de views por post (`recent_views_gain`).
-    """
     if not isinstance(base_acc, dict):
         base_acc = {}
     if not isinstance(new_acc, dict):
@@ -805,18 +871,26 @@ def merge_best_account_data(base_acc, new_acc):
                 pid = str(p["id"])
                 p_copy = dict(p)
                 p_copy["views"] = _safe_int(p.get("views"))
+                p_copy["duration_sec"] = _safe_float(p.get("duration_sec"))
+                if p_copy["duration_sec"] > 0:
+                    MEDIA_DURATION_CACHE[pid] = p_copy["duration_sec"]
                 posts_by_id[pid] = p_copy
 
         for p in new_posts:
             if isinstance(p, dict) and p.get("id"):
                 pid = str(p["id"])
                 new_v = _safe_int(p.get("views"))
+                new_dur = _safe_float(p.get("duration_sec"))
                 if pid in posts_by_id:
                     old_v = _safe_int(posts_by_id[pid].get("views"))
+                    old_dur = _safe_float(posts_by_id[pid].get("duration_sec"))
                     prev_gain = _safe_int(posts_by_id[pid].get("recent_views_gain"))
                     best_p = dict(posts_by_id[pid])
                     best_p.update(p)
                     best_p["views"] = max(old_v, new_v)
+                    best_p["duration_sec"] = max(old_dur, new_dur, MEDIA_DURATION_CACHE.get(pid, 0.0))
+                    if best_p["duration_sec"] > 0:
+                        MEDIA_DURATION_CACHE[pid] = best_p["duration_sec"]
                     if new_v > old_v and old_v > 0:
                         best_p["recent_views_gain"] = (new_v - old_v)
                     else:
@@ -825,6 +899,9 @@ def merge_best_account_data(base_acc, new_acc):
                 else:
                     p_copy = dict(p)
                     p_copy["views"] = new_v
+                    p_copy["duration_sec"] = max(new_dur, MEDIA_DURATION_CACHE.get(pid, 0.0))
+                    if p_copy["duration_sec"] > 0:
+                        MEDIA_DURATION_CACHE[pid] = p_copy["duration_sec"]
                     p_copy["recent_views_gain"] = _safe_int(p.get("recent_views_gain"))
                     posts_by_id[pid] = p_copy
 
@@ -880,7 +957,7 @@ def merge_best_account_data(base_acc, new_acc):
 def get_env_accounts():
     """
     Lê as contas de ACCOUNTS_CONFIG_JSON e também mescla com quaisquer métricas
-    salvas em `contas_conectadas.json` da pasta do projeto.
+    salvas em `contas_conectadas.json`, ignorando contas excluídas pelo usuário.
     """
     raw = os.environ.get("ACCOUNTS_CONFIG_JSON", "").strip()
     accounts_dict = {}
@@ -895,15 +972,16 @@ def get_env_accounts():
                 for item in data:
                     if isinstance(item, dict):
                         uid = str(item.get("ig_user_id", "")).strip()
-                        if uid:
+                        if uid and uid not in MEMORY_DELETED_IDS:
                             accounts_dict[uid] = dict(item)
             elif isinstance(data, dict):
                 for uid, item in data.items():
                     if isinstance(item, dict):
                         item_copy = dict(item)
                         uid_clean = str(item_copy.get("ig_user_id") or uid).strip()
-                        item_copy["ig_user_id"] = uid_clean
-                        accounts_dict[uid_clean] = item_copy
+                        if uid_clean and uid_clean not in MEMORY_DELETED_IDS:
+                            item_copy["ig_user_id"] = uid_clean
+                            accounts_dict[uid_clean] = item_copy
         except Exception as e:
             print(f"[ERRO] Falha ao ler ACCOUNTS_CONFIG_JSON: {e}", flush=True)
 
@@ -916,6 +994,8 @@ def get_env_accounts():
                     for uid, item in c1_accs.items():
                         if isinstance(item, dict):
                             uid_str = str(item.get("ig_user_id") or uid).strip()
+                            if uid_str in MEMORY_DELETED_IDS:
+                                continue
                             if uid_str in accounts_dict:
                                 token_backup = accounts_dict[uid_str].get("access_token") or item.get("access_token")
                                 accounts_dict[uid_str] = merge_best_account_data(item, accounts_dict[uid_str])
@@ -932,26 +1012,53 @@ def get_env_accounts():
 
 
 def get_saved_state(force_redis=False):
-    """
-    Carrega e mescla todas as fontes de histórico (Upstash Redis, /tmp, JSON local e RAM).
-    Só marca `REDIS_BOOTSTRAPPED = True` se a leitura do Upstash realmente tiver sucesso!
-    """
-    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED
+    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_DELETED_IDS
 
     with ACCOUNTS_LOCK:
         merged_accounts = {}
         last_ts = MEMORY_LAST_SYNC_TS
         last_str = MEMORY_LAST_SYNC_STR
 
-        # 1. Dados vindos da configuração/ambiente ou Código 1
+        # Carrega primeiro deleted_ids de arquivos locais e do Upstash antes de mesclar contas
+        for fpath in (BUNDLED_MONITOR_FILE, RUNTIME_ACCOUNTS_FILE):
+            if os.path.exists(fpath):
+                fdata = load_json(fpath, {})
+                if isinstance(fdata, dict):
+                    for d_id in fdata.get("deleted_ids", []):
+                        MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+        now = time.time()
+        should_query_redis = (
+            is_upstash_configured()
+            and (force_redis or not REDIS_BOOTSTRAPPED or (now - LAST_REDIS_FETCH_TS >= REDIS_READ_TTL))
+        )
+
+        redis_state = {}
+        ok_redis = False
+        if should_query_redis:
+            ok_redis, redis_state = load_state_from_upstash()
+            if ok_redis:
+                LAST_REDIS_FETCH_TS = now
+                REDIS_BOOTSTRAPPED = True
+                if isinstance(redis_state, dict):
+                    for d_id in redis_state.get("deleted_ids", []):
+                        MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+        # Remove da memória qualquer conta que esteja marcada como excluída
+        for d_id in list(MEMORY_DELETED_IDS):
+            MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
+
+        # 1. Dados vindos da configuração/ambiente
         env_accs = get_env_accounts()
         for uid, acc in env_accs.items():
             uid_s = str(uid).strip()
+            if uid_s in MEMORY_DELETED_IDS:
+                continue
             clean_acc = dict(acc)
             clean_acc.pop("access_token", None)
             merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), clean_acc)
 
-        # 2. Dados do arquivo contas_monitoradas.json na raiz do projeto (se existir)
+        # 2. Dados do arquivo contas_monitoradas.json na raiz
         if os.path.exists(BUNDLED_MONITOR_FILE):
             bundled = load_json(BUNDLED_MONITOR_FILE, {})
             if isinstance(bundled, dict):
@@ -960,6 +1067,8 @@ def get_saved_state(force_redis=False):
                     for uid, acc in b_accs.items():
                         if isinstance(acc, dict):
                             uid_s = str(acc.get("ig_user_id") or uid).strip()
+                            if uid_s in MEMORY_DELETED_IDS:
+                                continue
                             acc_clean = dict(acc)
                             acc_clean.pop("access_token", None)
                             merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc_clean)
@@ -976,6 +1085,8 @@ def get_saved_state(force_redis=False):
                     for uid, acc in r_accs.items():
                         if isinstance(acc, dict):
                             uid_s = str(acc.get("ig_user_id") or uid).strip()
+                            if uid_s in MEMORY_DELETED_IDS:
+                                continue
                             acc_clean = dict(acc)
                             acc_clean.pop("access_token", None)
                             merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc_clean)
@@ -983,37 +1094,31 @@ def get_saved_state(force_redis=False):
                     last_ts = float(runtime["last_global_sync_ts"])
                     last_str = runtime.get("last_global_sync_str", last_str)
 
-        # 4. Dados persistentes do UPSTASH REDIS
-        now = time.time()
-        should_query_redis = (
-            is_upstash_configured()
-            and (force_redis or not REDIS_BOOTSTRAPPED or (now - LAST_REDIS_FETCH_TS >= REDIS_READ_TTL))
-        )
-
-        if should_query_redis:
-            ok_redis, redis_state = load_state_from_upstash()
-            if ok_redis:
-                LAST_REDIS_FETCH_TS = now
-                REDIS_BOOTSTRAPPED = True
-                if isinstance(redis_state, dict):
-                    redis_accs = redis_state.get("accounts", {})
-                    if isinstance(redis_accs, dict):
-                        for uid, acc in redis_accs.items():
-                            if isinstance(acc, dict):
-                                uid_s = str(acc.get("ig_user_id") or uid).strip()
-                                acc_clean = dict(acc)
-                                acc_clean.pop("access_token", None)
-                                merged_accounts[uid_s] = merge_best_account_data(
-                                    merged_accounts.get(uid_s, {}), acc_clean
-                                )
-                    if float(redis_state.get("last_global_sync_ts") or 0) > last_ts:
-                        last_ts = float(redis_state["last_global_sync_ts"])
-                        last_str = redis_state.get("last_global_sync_str", last_str)
+        # 4. Dados persistentes do UPSTASH REDIS (já carregados acima se should_query_redis)
+        if ok_redis and isinstance(redis_state, dict):
+            redis_accs = redis_state.get("accounts", {})
+            if isinstance(redis_accs, dict):
+                for uid, acc in redis_accs.items():
+                    if isinstance(acc, dict):
+                        uid_s = str(acc.get("ig_user_id") or uid).strip()
+                        if uid_s in MEMORY_DELETED_IDS:
+                            continue
+                        acc_clean = dict(acc)
+                        acc_clean.pop("access_token", None)
+                        merged_accounts[uid_s] = merge_best_account_data(
+                            merged_accounts.get(uid_s, {}), acc_clean
+                        )
+            if float(redis_state.get("last_global_sync_ts") or 0) > last_ts:
+                last_ts = float(redis_state["last_global_sync_ts"])
+                last_str = redis_state.get("last_global_sync_str", last_str)
 
         # 5. Cache em memória RAM
-        for uid, acc in MEMORY_CACHE_ACCOUNTS.items():
+        for uid, acc in list(MEMORY_CACHE_ACCOUNTS.items()):
+            uid_s = str(uid).strip()
+            if uid_s in MEMORY_DELETED_IDS:
+                MEMORY_CACHE_ACCOUNTS.pop(uid_s, None)
+                continue
             if isinstance(acc, dict):
-                uid_s = str(uid).strip()
                 merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc)
 
         for uid, acc in merged_accounts.items():
@@ -1026,6 +1131,7 @@ def get_saved_state(force_redis=False):
         result_state = {
             "last_global_sync_ts": last_ts,
             "last_global_sync_str": last_str,
+            "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "accounts": sorted_accs
         }
 
@@ -1038,11 +1144,16 @@ def get_saved_state(force_redis=False):
 
 
 def save_current_state(state_data):
-    """Salva o estado simultaneamente na Memória, no /tmp, no disco local e no Upstash Redis."""
-    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR
+    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS
 
     with ACCOUNTS_LOCK:
         if isinstance(state_data, dict):
+            for d_id in state_data.get("deleted_ids", []):
+                MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+            for d_id in list(MEMORY_DELETED_IDS):
+                MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
+
             if float(state_data.get("last_global_sync_ts") or 0) > MEMORY_LAST_SYNC_TS:
                 MEMORY_LAST_SYNC_TS = float(state_data["last_global_sync_ts"])
                 MEMORY_LAST_SYNC_STR = state_data.get("last_global_sync_str", MEMORY_LAST_SYNC_STR)
@@ -1050,12 +1161,15 @@ def save_current_state(state_data):
             if isinstance(state_data.get("accounts"), dict):
                 for uid, acc in state_data["accounts"].items():
                     uid_s = str(uid).strip()
+                    if uid_s in MEMORY_DELETED_IDS:
+                        continue
                     clean_acc = dict(acc)
                     clean_acc.pop("access_token", None)
                     MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
                         MEMORY_CACHE_ACCOUNTS.get(uid_s, {}), clean_acc
                     )
                 state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
+                state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
 
         if is_upstash_configured():
             save_state_to_upstash(state_data)
@@ -1064,6 +1178,46 @@ def save_current_state(state_data):
 
         if RUNTIME_ACCOUNTS_FILE != BUNDLED_MONITOR_FILE and os.access(BASE_DIR, os.W_OK):
             save_json(BUNDLED_MONITOR_FILE, state_data)
+
+
+def delete_account_permanently(acc_id):
+    """
+    Remove uma conta do painel em memória, nos JSONs locais e no Upstash Redis,
+    registrando seu ID em `deleted_ids` para que não volte na sincronização.
+    """
+    uid_s = str(acc_id or "").strip()
+    if not uid_s:
+        return False
+
+    with ACCOUNTS_LOCK:
+        state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
+        MEMORY_DELETED_IDS.add(uid_s)
+        MEMORY_CACHE_ACCOUNTS.pop(uid_s, None)
+
+        accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
+        accounts.pop(uid_s, None)
+
+        # Se existir em contas_conectadas.json local e tivermos permissão de escrita, remove de lá também
+        if os.path.exists(CODIGO1_ACCOUNTS_FILE) and os.access(BASE_DIR, os.W_OK):
+            try:
+                c1_data = load_json(CODIGO1_ACCOUNTS_FILE, {})
+                if isinstance(c1_data, dict):
+                    if "accounts" in c1_data and isinstance(c1_data["accounts"], dict):
+                        c1_data["accounts"].pop(uid_s, None)
+                    else:
+                        c1_data.pop(uid_s, None)
+                    save_json(CODIGO1_ACCOUNTS_FILE, c1_data)
+            except Exception:
+                pass
+
+        new_state = {
+            "last_global_sync_ts": state.get("last_global_sync_ts", MEMORY_LAST_SYNC_TS),
+            "last_global_sync_str": state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR),
+            "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "accounts": sort_accounts_by_views_desc(accounts)
+        }
+        save_current_state(new_state)
+        return True
 
 
 # ==============================================================================
@@ -1119,7 +1273,7 @@ def add_security_headers(response):
 
 
 # ==============================================================================
-# COLETOR DE MÉTRICAS BLINDADO (NUNCA ZERA SEGUIDORES OU VIEWS SE A CONTA CAIR)
+# COLETOR DE MÉTRICAS E DURAÇÃO DOS VÍDEOS
 # ==============================================================================
 
 def _fetch_single_media_views(media_item, access_token):
@@ -1207,10 +1361,6 @@ def _classify_instagram_account_status(profile_ok, profile_err_obj, pub_limit_re
 
 
 def fetch_account_current_metrics(acc_config, last_json_entry):
-    """
-    Busca os números atuais na Meta e NUNCA apaga nem reduz para zero os seguidores,
-    visualizações totais, recordes de velocidade ou lista de posts que já estavam salvos.
-    """
     ig_user_id = str(acc_config.get("ig_user_id", "")).strip()
     access_token = acc_config.get("access_token", "")
     now_ts = time.time()
@@ -1319,10 +1469,11 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
     inline_ok = False
     media_fetch_error = False
 
+    # Solicita também media_url para permitir a inspeção rápida dos 64KB iniciais do MP4 e extrair a duração
     try:
         next_url = media_url
         params = {
-            "fields": "id,caption,media_type,media_product_type,permalink,shortcode,timestamp,like_count,comments_count,insights.metric(views)",
+            "fields": "id,caption,media_type,media_product_type,media_url,permalink,shortcode,timestamp,like_count,comments_count,insights.metric(views)",
             "limit": 50,
             "access_token": access_token
         }
@@ -1346,7 +1497,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         try:
             next_url = media_url
             params = {
-                "fields": "id,caption,media_type,media_product_type,permalink,shortcode,timestamp,like_count,comments_count",
+                "fields": "id,caption,media_type,media_product_type,media_url,permalink,shortcode,timestamp,like_count,comments_count",
                 "limit": 50,
                 "access_token": access_token
             }
@@ -1372,6 +1523,10 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
     }
     prev_gain_by_post_id = {
         str(p.get("id")): _safe_int(p.get("recent_views_gain"))
+        for p in prev_posts_list if isinstance(p, dict) and p.get("id")
+    }
+    prev_dur_by_post_id = {
+        str(p.get("id")): _safe_float(p.get("duration_sec"))
         for p in prev_posts_list if isinstance(p, dict) and p.get("id")
     }
 
@@ -1413,12 +1568,38 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                     media_views_map[mid] = fallback_v
                     total_views += fallback_v
 
+    # Descobre a duração em segundos (em paralelo) para vídeos que ainda não têm duration_sec salvo
+    media_durations_map = {}
+    items_needing_duration = []
+    for m_item in all_media:
+        mid = str(m_item.get("id", ""))
+        cached_dur = max(prev_dur_by_post_id.get(mid, 0.0), MEDIA_DURATION_CACHE.get(mid, 0.0))
+        if cached_dur > 0:
+            media_durations_map[mid] = cached_dur
+        elif m_item.get("media_url"):
+            items_needing_duration.append(m_item)
+
+    if items_needing_duration:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            dur_futures = {
+                str(item.get("id")): pool.submit(_probe_video_duration_seconds, item)
+                for item in items_needing_duration if item.get("id")
+            }
+            for mid, fut in dur_futures.items():
+                try:
+                    d_sec = _safe_float(fut.result())
+                    if d_sec > 0:
+                        media_durations_map[mid] = d_sec
+                except Exception:
+                    pass
+
     posts_ranked = []
     for m_item in all_media:
         mid = str(m_item.get("id", ""))
         old_v = prev_views_by_post_id.get(mid, 0)
         v_count = int(media_views_map.get(mid, old_v))
         recent_gain = (v_count - old_v) if (v_count > old_v and old_v > 0) else prev_gain_by_post_id.get(mid, 0)
+        dur_sec = round(max(media_durations_map.get(mid, 0.0), prev_dur_by_post_id.get(mid, 0.0)), 1)
 
         shortcode = m_item.get("shortcode", "")
         permalink = (m_item.get("permalink") or "").strip()
@@ -1440,6 +1621,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
             "id": mid,
             "views": v_count,
             "recent_views_gain": recent_gain,
+            "duration_sec": dur_sec,
             "permalink": permalink or reels_link,
             "reels_url": reels_link or permalink,
             "shortcode": shortcode,
@@ -1479,14 +1661,15 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
 
 
 def refresh_all_accounts_to_json():
-    """
-    Atualiza todas as contas preservando os melhores dados históricos e salva
-    tudo no Upstash Redis com 1 único comando SET ao final.
-    """
     with SYNC_LOCK:
         saved_state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
         saved_accounts = saved_state.get("accounts", {}) if isinstance(saved_state, dict) else {}
         env_accounts = get_env_accounts()
+
+        # Garante que contas excluídas nunca voltem
+        for d_id in list(MEMORY_DELETED_IDS):
+            saved_accounts.pop(d_id, None)
+            env_accounts.pop(d_id, None)
 
         if not env_accounts:
             if saved_accounts:
@@ -1494,8 +1677,10 @@ def refresh_all_accounts_to_json():
                 save_current_state(saved_state)
             return saved_state
 
-        acc_ids = list(env_accounts.keys())
-        new_accounts_map = dict(saved_accounts)
+        acc_ids = [aid for aid in env_accounts.keys() if str(aid).strip() not in MEMORY_DELETED_IDS]
+        new_accounts_map = {
+            k: v for k, v in saved_accounts.items() if str(k).strip() not in MEMORY_DELETED_IDS
+        }
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
@@ -1508,6 +1693,8 @@ def refresh_all_accounts_to_json():
             }
             for acc_id, fut in futures.items():
                 uid_s = str(acc_id).strip()
+                if uid_s in MEMORY_DELETED_IDS:
+                    continue
                 try:
                     updated_acc = fut.result()
                     new_accounts_map[uid_s] = merge_best_account_data(
@@ -1526,6 +1713,7 @@ def refresh_all_accounts_to_json():
         updated_state = {
             "last_global_sync_ts": now_ts,
             "last_global_sync_str": now_str,
+            "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "accounts": sorted_accounts_map
         }
         save_current_state(updated_state)
@@ -1533,7 +1721,7 @@ def refresh_all_accounts_to_json():
 
 
 # ==============================================================================
-# THREAD LOCAL DE 5 EM 5 MINUTOS (AGUARDA BOOT PARA EVITAR RACE CONDITION)
+# THREAD LOCAL DE 5 EM 5 MINUTOS
 # ==============================================================================
 
 def background_5min_loop():
@@ -1558,7 +1746,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (COM PAINEL TÁTICO DE ALOCAÇÃO DE LOTES + DIAGNÓSTICO DE TRAÇÃO)
+# TEMPLATE HTML (COM EXCLUSÃO DE CONTA + POPUP MODAL + DURAÇÃO DO VÍDEO EM SEGUNDOS)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -1582,7 +1770,7 @@ HTML_TEMPLATE = r"""
         }
         * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
-        .container { max-width: 1620px; margin: 0 auto; display: grid; gap: 18px; }
+        .container { max-width: 1650px; margin: 0 auto; display: grid; gap: 18px; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
         h1, h2, h3 { margin: 0; }
         .hint { font-size: 0.82rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
@@ -1623,6 +1811,26 @@ HTML_TEMPLATE = r"""
             color: #ffffff;
             border-color: #38bdf8;
         }
+        .delete-acc-btn {
+            padding: 6px 9px;
+            border-radius: 6px;
+            background: rgba(239, 68, 68, 0.16);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            cursor: pointer;
+            font-size: 0.85rem;
+            line-height: 1;
+            transition: 0.18s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .delete-acc-btn:hover {
+            background: #ef4444;
+            color: #ffffff;
+            border-color: #ef4444;
+            transform: scale(1.05);
+        }
         .posts-dropdown-row { background: #0b1120; }
         .posts-dropdown-box {
             padding: 12px 14px;
@@ -1651,6 +1859,16 @@ HTML_TEMPLATE = r"""
         .post-rank-link:hover {
             text-decoration: underline;
             color: #7dd3fc;
+        }
+        .duration-pill {
+            background: rgba(168, 85, 247, 0.18);
+            color: #e9d5ff;
+            border: 1px solid rgba(168, 85, 247, 0.4);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.76rem;
+            font-weight: 700;
+            white-space: nowrap;
         }
         .top-stats-bar {
             display: flex;
@@ -1716,6 +1934,69 @@ HTML_TEMPLATE = r"""
             display: block;
             margin-top: 2px;
         }
+        /* MODAL POP-UP DE CONFIRMAÇÃO DE EXCLUSÃO */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(2, 6, 23, 0.78);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            padding: 16px;
+            backdrop-filter: blur(3px);
+        }
+        .modal-card {
+            background: #1e293b;
+            border: 1px solid #ef4444;
+            border-radius: 12px;
+            max-width: 440px;
+            width: 100%;
+            padding: 22px 24px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+        }
+        .modal-title {
+            font-size: 1.08rem;
+            font-weight: 700;
+            color: #f87171;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .modal-body {
+            font-size: 0.88rem;
+            color: #cbd5e1;
+            line-height: 1.5;
+            margin-bottom: 18px;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        .btn-cancel {
+            padding: 8px 15px;
+            border-radius: 7px;
+            background: #334155;
+            color: #e2e8f0;
+            border: 1px solid #475569;
+            font-weight: 600;
+            font-size: 0.84rem;
+            cursor: pointer;
+        }
+        .btn-cancel:hover { background: #475569; }
+        .btn-confirm-delete {
+            padding: 8px 16px;
+            border-radius: 7px;
+            background: #ef4444;
+            color: #ffffff;
+            border: none;
+            font-weight: 700;
+            font-size: 0.84rem;
+            cursor: pointer;
+        }
+        .btn-confirm-delete:hover { background: #dc2626; }
     </style>
 </head>
 <body>
@@ -1877,13 +2158,14 @@ HTML_TEMPLATE = r"""
                         <th>Último Lote & Janela Pico</th>
                         <th style="min-width:230px;">🧠 Recomendação Operacional</th>
                         <th>Última Coleta</th>
+                        <th style="width:52px; text-align:center;">Excluir</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for acc_id, acc in accounts.items() %}
                     {% set posts_ordenados = acc.get('posts_list', []) %}
                     {% set intel = acc.get('intel', {}) %}
-                    <tr>
+                    <tr id="acc_row_{{ acc_id }}">
                         <td style="text-align:center; white-space:nowrap;">
                             <div style="display:inline-flex; align-items:center; gap:6px;">
                                 <span class="badge info" style="min-width:30px; text-align:center;">#{{ loop.index }}</span>
@@ -1963,13 +2245,18 @@ HTML_TEMPLATE = r"""
                         <td>
                             <span style="font-size:0.8rem;">{{ acc.get('metrics_updated_at', '—') }}</span>
                         </td>
+                        <td style="text-align:center;">
+                            <button type="button" class="delete-acc-btn" onclick="abrirModalExclusao('{{ acc_id }}', '{{ acc.username }}')" title="Remover @{{ acc.username }} do painel">
+                                🗑️
+                            </button>
+                        </td>
                     </tr>
                     <tr id="posts_row_{{ acc_id }}" class="posts-dropdown-row" style="display:none;">
-                        <td colspan="12" style="padding:10px 16px;">
+                        <td colspan="13" style="padding:10px 16px;">
                             <div class="posts-dropdown-box">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
                                     <b style="color:#38bdf8; font-size:0.88rem;">
-                                        📊 Posts / Reels de @{{ acc.username }} — Diagnóstico de Tração, Ganho Recente e Horário Real (BRT)
+                                        📊 Posts / Reels de @{{ acc.username }} — Diagnóstico de Tração, Duração do Vídeo e Horário Real (BRT)
                                     </b>
                                     <span style="color:var(--muted); font-size:0.78rem;">
                                         Total: {{ posts_ordenados|length }} post(s) |
@@ -1996,6 +2283,9 @@ HTML_TEMPLATE = r"""
                                             <a href="{{ p.get('reels_url') or p.get('permalink') or '#' }}" target="_blank" rel="noopener noreferrer" class="post-rank-link">
                                                 🔗 {{ p.get('reels_url') or p.get('permalink') or ('ID: ' ~ p.get('id')) }}
                                             </a>
+                                            <span class="duration-pill" title="Duração exata do vídeo em segundos">
+                                                ⏱️ {{ p.get('duration_sec', 0) | fmt_dur }}
+                                            </span>
                                         </div>
                                         <div style="color:var(--muted); font-size:0.78rem; text-align:right; white-space:nowrap;">
                                             <span>⏳ Idade: <b style="color:#e2e8f0;">{{ p.get('age_human', '—') }}</b></span>
@@ -2023,7 +2313,80 @@ HTML_TEMPLATE = r"""
     </div>
 </div>
 
+<!-- POP-UP MODAL DE CONFIRMAÇÃO DE EXCLUSÃO DE CONTA -->
+<div id="deleteModalOverlay" class="modal-overlay" onclick="fecharModalSeClicarFora(event)">
+    <div class="modal-card">
+        <div class="modal-title">
+            🗑️ Confirmar Exclusão da Conta
+        </div>
+        <div class="modal-body">
+            Tem certeza que deseja remover a conta <b id="modalDeleteUsername" style="color:#f8fafc;">@conta</b> (ID: <code id="modalDeleteAccId">—</code>) deste painel?<br><br>
+            <span style="color:#fbbf24; font-size:0.81rem;">⚠️ A conta será removida imediatamente da visualização e do banco persistente (Upstash Redis).</span>
+        </div>
+        <div class="modal-actions">
+            <button type="button" class="btn-cancel" onclick="fecharModalExclusao()">Cancelar</button>
+            <button type="button" id="btnConfirmDeleteAcc" class="btn-confirm-delete" onclick="confirmarExclusaoConta()">Sim, Excluir Conta</button>
+        </div>
+    </div>
+</div>
+
 <script>
+    let contaPendenteExclusaoId = null;
+    let contaPendenteExclusaoUser = null;
+
+    function abrirModalExclusao(accId, username) {
+        contaPendenteExclusaoId = accId;
+        contaPendenteExclusaoUser = username;
+        document.getElementById('modalDeleteUsername').innerText = '@' + username;
+        document.getElementById('modalDeleteAccId').innerText = accId;
+        const btn = document.getElementById('btnConfirmDeleteAcc');
+        btn.disabled = false;
+        btn.innerText = 'Sim, Excluir Conta';
+        document.getElementById('deleteModalOverlay').style.display = 'flex';
+    }
+
+    function fecharModalExclusao() {
+        contaPendenteExclusaoId = null;
+        contaPendenteExclusaoUser = null;
+        document.getElementById('deleteModalOverlay').style.display = 'none';
+    }
+
+    function fecharModalSeClicarFora(ev) {
+        if (ev.target && ev.target.id === 'deleteModalOverlay') {
+            fecharModalExclusao();
+        }
+    }
+
+    async function confirmarExclusaoConta() {
+        if (!contaPendenteExclusaoId) return;
+        const btn = document.getElementById('btnConfirmDeleteAcc');
+        btn.disabled = true;
+        btn.innerText = '⏳ Excluindo...';
+
+        try {
+            const res = await fetch('/api/delete_account/' + encodeURIComponent(contaPendenteExclusaoId), {
+                method: 'POST'
+            });
+            const data = await res.json();
+            if (res.ok && data.ok) {
+                const rowMain = document.getElementById('acc_row_' + contaPendenteExclusaoId);
+                const rowPosts = document.getElementById('posts_row_' + contaPendenteExclusaoId);
+                if (rowMain) rowMain.remove();
+                if (rowPosts) rowPosts.remove();
+                fecharModalExclusao();
+                window.location.reload();
+            } else {
+                alert('Erro ao excluir conta: ' + (data.error || 'Falha desconhecida'));
+                btn.disabled = false;
+                btn.innerText = 'Sim, Excluir Conta';
+            }
+        } catch (e) {
+            alert('Erro de rede ao tentar excluir conta: ' + e);
+            btn.disabled = false;
+            btn.innerText = 'Sim, Excluir Conta';
+        }
+    }
+
     function togglePostsConta(accId, btnEl) {
         const row = document.getElementById('posts_row_' + accId);
         if (!row) return;
@@ -2078,6 +2441,10 @@ HTML_TEMPLATE = r"""
 
     let remaining = 60;
     setInterval(() => {
+        // Pausa o reload automático se o modal de confirmação estiver aberto
+        const modal = document.getElementById('deleteModalOverlay');
+        if (modal && modal.style.display === 'flex') return;
+
         remaining--;
         const el = document.getElementById('reloadCountdown');
         if (el) el.innerText = remaining + 's';
@@ -2092,7 +2459,7 @@ HTML_TEMPLATE = r"""
 
 
 # ==============================================================================
-# ROTAS FLASK E API DE FILA INTELIGENTE
+# ROTAS FLASK E API DE FILA INTELIGENTE + EXCLUSÃO DE CONTAS
 # ==============================================================================
 
 @app.route("/", methods=["GET"])
@@ -2174,14 +2541,18 @@ def index():
     )
 
 
+@app.route("/api/delete_account/<acc_id>", methods=["POST", "DELETE"])
+@requires_auth
+def api_delete_account(acc_id):
+    ok = delete_account_permanently(acc_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "ID de conta inválido."}), 400
+    return jsonify({"ok": True, "deleted_id": str(acc_id).strip()})
+
+
 @app.route("/api/smart_queue", methods=["GET"])
 @requires_auth
 def api_smart_queue():
-    """
-    Endpoint JSON pronto para integrar ao seu publicador local:
-    Retorna a fila priorizada de contas indicando quais podem receber lote agora
-    (`can_post_now: true`), o tamanho recomendado do lote e quais devem aguardar cooldown.
-    """
     state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
     queue = []
@@ -2232,7 +2603,7 @@ def export_snapshot():
     saved_accs = state.get("accounts", {})
 
     export_dict = {}
-    all_uids = set(env_accs.keys()) | set(saved_accs.keys())
+    all_uids = (set(env_accs.keys()) | set(saved_accs.keys())) - MEMORY_DELETED_IDS
     for uid in all_uids:
         uid_s = str(uid).strip()
         env_item = env_accs.get(uid_s, {})
