@@ -4,6 +4,7 @@ import hmac
 import json
 import time
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from functools import wraps
@@ -91,7 +92,7 @@ app.jinja_env.filters["fmt_rate"] = format_rate_br
 
 
 # ==============================================================================
-# CÁLCULO DE VIEWS/MIN E VIEWS/HORA ATUAIS (SEM VIEWS ANTIGAS) + RECORDES
+# UTILITÁRIOS DE CONVERSÃO, TIMESTAMPS (CORREÇÃO UTC -> BRT) E VELOCIDADE
 # ==============================================================================
 
 def _safe_int(val):
@@ -127,6 +128,75 @@ def _parse_br_datetime_to_ts(dt_str):
         except Exception:
             continue
     return None
+
+
+def _parse_ig_post_timestamp_to_brt(ts_str):
+    """
+    Corrige o timestamp dos posts do Instagram:
+    A Graph API retorna timestamps em UTC (ex: '2026-11-03T17:53:00+0000' ou '2026-11-03 17:53').
+    Converte com precisão para o fuso de Brasília (BRT / UTC-3) e evita que posts recém-publicados
+    pareçam estar '3 horas no futuro'.
+    """
+    if not ts_str or not isinstance(ts_str, str):
+        return None, "—"
+    s = ts_str.strip()
+    now_ts = time.time()
+
+    # Caso 1: Formato ISO completo vindo direto da API da Meta
+    if "T" in s or "+" in s:
+        try:
+            clean_iso = s.replace("+0000", "+00:00").replace("Z", "+00:00")
+            dt_utc = datetime.fromisoformat(clean_iso)
+            if dt_utc.tzinfo is None:
+                dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            dt_brt = dt_utc.astimezone(BRT)
+            return dt_brt.timestamp(), dt_brt.strftime("%d/%m %H:%M")
+        except Exception:
+            pass
+
+    # Caso 2: Formato curto salvo anteriormente ('YYYY-MM-DD HH:MM')
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt_naive = datetime.strptime(s[:19].strip(), fmt)
+            # No código anterior, `ts_raw[:16].replace("T", " ")` salvava em UTC sem timezone.
+            # Assumimos UTC para traduzir corretamente para BRT:
+            dt_utc = dt_naive.replace(tzinfo=timezone.utc)
+            dt_brt = dt_utc.astimezone(BRT)
+            ts_val = dt_brt.timestamp()
+            # Fallback de segurança caso algum registro já estivesse em BRT
+            if ts_val > now_ts + 600:
+                dt_brt = dt_naive.replace(tzinfo=BRT)
+                ts_val = dt_brt.timestamp()
+            return ts_val, dt_brt.strftime("%d/%m %H:%M")
+        except Exception:
+            continue
+
+    # Caso 3: Formato BR ('DD/MM/YYYY HH:MM')
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m %H:%M"):
+        try:
+            dt_brt = datetime.strptime(s, fmt).replace(tzinfo=BRT)
+            return dt_brt.timestamp(), dt_brt.strftime("%d/%m %H:%M")
+        except Exception:
+            continue
+
+    return None, s
+
+
+def _format_age_human(seconds):
+    if seconds is None or seconds < 0:
+        return "agora"
+    mins = int(seconds // 60)
+    if mins < 1:
+        return "agora"
+    if mins < 60:
+        return f"{mins}min"
+    hours = mins // 60
+    rem_mins = mins % 60
+    if hours < 24:
+        return f"{hours}h{rem_mins:02d}m" if rem_mins else f"{hours}h"
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"{days}d {rem_hours}h" if rem_hours else f"{days}d"
 
 
 def _merge_views_history(old_hist, new_hist, current_views=0, current_ts=None):
@@ -179,7 +249,6 @@ def _compute_account_velocity_rates(acc_dict):
 
     hist = acc_dict.get("views_history")
     if not isinstance(hist, list) or len(hist) < 2:
-        # Ainda na primeira leitura (sem delta entre duas coletas atuais)
         return 0.0, 0.0
 
     now_ts = time.time()
@@ -187,13 +256,10 @@ def _compute_account_velocity_rates(acc_dict):
     latest_ts = _safe_float(latest.get("ts"))
     latest_views = _safe_int(latest.get("views"))
 
-    # Se a última coleta válida da conta ocorreu há mais de 2 horas (ex: conta caiu há horas),
-    # a velocidade atual em tempo real é 0 (os recordes permanecem salvos nas colunas de recorde)
     if latest_ts <= 0 or (now_ts - latest_ts) > 7200:
         return 0.0, 0.0
 
     # 1. VIEWS / MIN ATUAL:
-    # Compara a coleta mais recente com a coleta imediatamente anterior (mínimo de 45s de intervalo)
     ref_min_pt = None
     for pt in reversed(hist[:-1]):
         dt_sec = latest_ts - _safe_float(pt.get("ts"))
@@ -206,18 +272,15 @@ def _compute_account_velocity_rates(acc_dict):
     dt_min_sec = latest_ts - _safe_float(ref_min_pt.get("ts"))
     dv_min = max(0, latest_views - _safe_int(ref_min_pt.get("views")))
     current_vpm = 0.0
-    # Considera apenas intervalos recentes (até 45 min entre uma coleta e outra)
     if 30 <= dt_min_sec <= 2700 and dv_min > 0:
         current_vpm = dv_min / (dt_min_sec / 60.0)
 
     # 2. VIEWS / HORA ATUAL:
-    # Busca os pontos dentro da última 1 hora (até 60 min atrás do snapshot mais recente)
     points_last_hour = [
         pt for pt in hist[:-1]
         if 60 <= (latest_ts - _safe_float(pt.get("ts"))) <= 3900
     ]
     if points_last_hour:
-        # Usa o ponto mais antigo dentro da janela de 1 hora
         ref_hour_pt = points_last_hour[0]
     else:
         ref_hour_pt = ref_min_pt
@@ -227,15 +290,288 @@ def _compute_account_velocity_rates(acc_dict):
     current_vph = 0.0
     if dt_hour_sec >= 30 and dv_hour > 0:
         if dt_hour_sec >= 3300:
-            # Já tem ~1 hora completa de janela medida
             current_vph = dv_hour / (dt_hour_sec / 3600.0)
         else:
-            # Menos de 1 hora de histórico: projeta a taxa atual medida na janela recente para 1h
-            # e nunca deixa menor que o ganho real já obtido nessa fração de hora
             projected_hour = dv_hour / (dt_hour_sec / 3600.0)
             current_vph = max(float(dv_hour), projected_hour)
 
     return round(current_vpm, 2), round(current_vph, 2)
+
+
+# ==============================================================================
+# MOTOR DE INTELIGÊNCIA OPERACIONAL E ALOCAÇÃO DE TRAÇÃO (NOVO!)
+# ==============================================================================
+
+def _analyze_account_intelligence(acc_dict):
+    """
+    Motor avançado de decisão para operação multicontas de Reels:
+    1. Calcula Índice de Atividade (Atual vs Recorde) e Aceleração Instantânea (Curto vs Médio Prazo).
+    2. Corrige timestamps UTC -> BRT de cada post e mede a idade do último lote postado.
+    3. Classifica cada vídeo (Megaviral, Hit, Acelerando, Em Maturação ou Flat/Morte Súbita).
+    4. Descobre a Janela de Horário de Ouro da conta com base nos hits históricos e no Redis.
+    5. Gera a Recomendação Operacional Exata (Surfar Tração, Aguardar Cooldown Anti-Canibalização,
+       Lote de Teste de Reativação ou Pausar Conta Zumbi).
+    """
+    if not isinstance(acc_dict, dict):
+        return {}
+
+    now_ts = time.time()
+    status_badge = acc_dict.get("account_status_badge", "success")
+    status_text = str(acc_dict.get("account_status") or "Ativa")
+    v_min = _safe_float(acc_dict.get("views_per_min"))
+    v_hour = _safe_float(acc_dict.get("views_per_hour"))
+    peak_min = max(_safe_float(acc_dict.get("peak_views_per_min")), v_min)
+    peak_hour = max(_safe_float(acc_dict.get("peak_views_per_hour")), v_hour)
+    total_views = _safe_int(acc_dict.get("total_views"))
+    followers = _safe_int(acc_dict.get("followers_count"))
+    media_count = _safe_int(acc_dict.get("media_count"))
+
+    # 1. Índice de Atividade (0% a 100% do Recorde Histórico Horário)
+    activity_index_pct = 0.0
+    if peak_hour > 0:
+        activity_index_pct = round(min(100.0, (v_hour / peak_hour) * 100.0), 1)
+
+    # 2. Taxa de Aceleração Instantânea (Views/Min atual projetado vs Views/Hora atual)
+    # Se > 1.15x, a conta está ganhando velocidade agora. Se < 0.80x, está desacelerando.
+    hourly_avg_vpm = (v_hour / 60.0) if v_hour > 0 else 0.0
+    accel_ratio = round(v_min / hourly_avg_vpm, 2) if hourly_avg_vpm >= 1.0 else (1.0 if v_min > 0 else 0.0)
+
+    if v_min <= 0.5:
+        trend_label = "💤 Parada"
+        trend_color = "#64748b"
+    elif accel_ratio >= 1.18:
+        trend_label = f"📈 Acelerando ({accel_ratio:.1f}x)"
+        trend_color = "#4ade80"
+    elif accel_ratio <= 0.78:
+        trend_label = f"📉 Esfriando ({accel_ratio:.1f}x)"
+        trend_color = "#fbbf24"
+    else:
+        trend_label = f"⚡ Estável ({accel_ratio:.1f}x)"
+        trend_color = "#38bdf8"
+
+    # 3. Análise profunda da lista de Posts (Idade BRT, Velocidade por Post, Morte Súbita e Hits)
+    posts = acc_dict.get("posts_list") if isinstance(acc_dict.get("posts_list"), list) else []
+    newest_post_ts = None
+    recent_batch_count_3h = 0
+    recent_batch_views_3h = 0
+    hits_10k = 0
+    virals_100k = 0
+    dead_posts_count = 0
+    top_post_views = 0
+    winning_hours_counter = Counter()
+
+    for p in posts:
+        if not isinstance(p, dict):
+            continue
+        p_views = _safe_int(p.get("views"))
+        top_post_views = max(top_post_views, p_views)
+        if p_views >= 10000:
+            hits_10k += 1
+        if p_views >= 100000:
+            virals_100k += 1
+
+        raw_ts = p.get("timestamp_raw") or p.get("timestamp") or ""
+        p_ts, brt_str = _parse_ig_post_timestamp_to_ts_and_str(raw_ts)
+        p["timestamp_brt"] = brt_str
+
+        age_sec = max(60.0, now_ts - p_ts) if p_ts else None
+        age_hours = (age_sec / 3600.0) if age_sec else None
+        p["age_human"] = _format_age_human(age_sec) if age_sec else "—"
+
+        # Contabiliza horário de publicação dos vídeos de sucesso (>= 10k views) para achar a Janela de Ouro
+        if p_ts and p_views >= 10000:
+            hr_brt = datetime.fromtimestamp(p_ts, tz=BRT).hour
+            winning_hours_counter[hr_brt] += (3 if p_views >= 100000 else 1)
+
+        if p_ts:
+            if newest_post_ts is None or p_ts > newest_post_ts:
+                newest_post_ts = p_ts
+            if age_sec <= 10800:  # últimos 180 min (3h)
+                recent_batch_count_3h += 1
+                recent_batch_views_3h += p_views
+
+        # Velocidade média vitalícia do post e diagnóstico individual (Morte Súbita vs Tração)
+        gain_recent = _safe_int(p.get("recent_views_gain"))
+        if p_views >= 100000:
+            p["diag_label"] = "🔥 Megaviral (+100k)"
+            p["diag_badge"] = "success"
+        elif p_views >= 25000:
+            p["diag_label"] = "🚀 Hit Validado"
+            p["diag_badge"] = "info"
+        elif age_hours is not None and age_hours <= 2.0:
+            if p_views >= 450 or gain_recent >= 80:
+                p["diag_label"] = "⚡ Tração Inicial Forte"
+                p["diag_badge"] = "success"
+            else:
+                p["diag_label"] = "⏳ Em Maturação (<2h)"
+                p["diag_badge"] = "warning"
+        elif age_hours is not None and age_hours > 2.0 and p_views < 400:
+            p["diag_label"] = "💀 Morte Súbita (<400)"
+            p["diag_badge"] = "error"
+            dead_posts_count += 1
+        elif p_views >= 5000:
+            p["diag_label"] = "✅ Entrega Saudável"
+            p["diag_badge"] = "info"
+        else:
+            p["diag_label"] = "😐 Alcance Baixo"
+            p["diag_badge"] = "warning"
+
+    total_listed_posts = len(posts)
+    hit_rate_10k_pct = round((hits_10k / total_listed_posts) * 100.0, 1) if total_listed_posts > 0 else 0.0
+    dead_rate_pct = round((dead_posts_count / total_listed_posts) * 100.0, 1) if total_listed_posts > 0 else 0.0
+    top_post_share_pct = round((top_post_views / total_views) * 100.0, 1) if total_views > 0 else 0.0
+    followers_per_1k_views = round((followers / total_views) * 1000.0, 2) if total_views > 0 else 0.0
+
+    # 4. Descoberta do Horário de Ouro (Janela de Pico da Conta em BRT)
+    best_window_str = "Sem dados suficientes"
+    if winning_hours_counter:
+        best_hr = winning_hours_counter.most_common(1)[0][0]
+        prep_hr = (best_hr - 1) % 24
+        end_hr = (best_hr + 2) % 24
+        best_window_str = f"Pico {best_hr:02d}h–{end_hr:02d}h (Postar ~{prep_hr:02d}:15)"
+    elif total_listed_posts > 0:
+        best_window_str = "Em calibração (testar 11h / 18h)"
+
+    # 5. Tempo desde o último post/lote na conta
+    mins_since_last_post = None
+    last_post_age_str = "Sem posts"
+    if newest_post_ts:
+        mins_since_last_post = max(0, int((now_ts - newest_post_ts) // 60))
+        last_post_age_str = f"há {_format_age_human(now_ts - newest_post_ts)}"
+
+    # 6. MOTOR DE DECISÃO: QUANDO E ONDE POSTAR O PRÓXIMO LOTE
+    action_code = "WAIT"
+    action_badge = "info"
+    action_title = "AGUARDAR"
+    action_detail = ""
+    priority_score = 0
+    can_post_now = False
+    recommended_batch_size = 0
+
+    if status_badge == "error" or "Caiu" in status_text or "Desconectada" in status_text or "Bloqueada" in status_text:
+        action_code = "RECONNECT"
+        action_badge = "error"
+        action_title = "🔌 RECONECTAR CONTA / TOKEN"
+        action_detail = "Sessão inválida ou checkpoint no Instagram. Faça login no aparelho antes de enviar lotes."
+        priority_score = -100
+        can_post_now = False
+    elif status_text == "Limite Diário Atingido":
+        action_code = "QUOTA_FULL"
+        action_badge = "warning"
+        action_title = "🛑 COTA 24H ATINGIDA"
+        action_detail = "Limite da API oficial atingido. Aguarde a liberação da janela de 24h."
+        priority_score = -50
+        can_post_now = False
+    elif total_listed_posts >= 15 and total_views < 15000 and v_min < 3.0:
+        # Conta Zumbi / Shadowban de alcance (ex: @floriindadona, @donaflloriinda, @donna_fllorinda)
+        action_code = "PAUSE_ZOMBIE"
+        action_badge = "error"
+        action_title = "🛑 PAUSAR 48H (CONTA TRAVADA)"
+        action_detail = (
+            f"Média de {int(total_views / max(1, total_listed_posts))} views/post ({dead_posts_count} vídeos <400 views). "
+            f"Não gaste criativos bons aqui; dê 48h de descanso."
+        )
+        priority_score = 5
+        can_post_now = False
+    elif mins_since_last_post is not None and mins_since_last_post < 120:
+        # Lote recém-postado há menos de 2 horas -> TRAVA ANTI-CANIBALIZAÇÃO!
+        wait_left = max(15, 120 - mins_since_last_post)
+        if v_min >= 50 or recent_batch_views_3h >= 1500:
+            action_code = "COOLDOWN_HOT"
+            action_badge = "warning"
+            action_title = f"⏳ NÃO CANIBALIZAR (AGUARDAR {wait_left}m)"
+            action_detail = (
+                f"Lote postado {last_post_age_str} já somou {format_number_br(recent_batch_views_3h)} views "
+                f"e a conta está a {format_rate_br(v_min)}/min. Deixe o lote atual maturar sozinho!"
+            )
+            priority_score = 65
+        else:
+            action_code = "COOLDOWN_MATURING"
+            action_badge = "info"
+            action_title = f"⏳ MATURANDO LOTE ({wait_left}m RESTANTES)"
+            action_detail = (
+                f"Último lote subiu {last_post_age_str} ({recent_batch_count_3h} vídeos). "
+                f"Espere completar 2h para avaliar se engatou antes de postar outro."
+            )
+            priority_score = 40
+        can_post_now = False
+    elif v_min >= 80 or (v_hour >= 4500 and activity_index_pct >= 55):
+        # CONTA QUENTE E JÁ PASSOU DO COOLDOWN DE 2H -> SURFAR TRAÇÃO AGORA!
+        action_code = "SURF_TRACTION"
+        action_badge = "success"
+        action_title = "🔥 SURFAR TRAÇÃO (POSTAR LOTE AGORA)"
+        action_detail = (
+            f"Entrega aberta ({format_rate_br(v_min)}/min | {activity_index_pct:.0f}% do recorde) e último lote "
+            f"foi {last_post_age_str}. Suba lote de 5 a 8 vídeos validados agora para pegar carona!"
+        )
+        priority_score = 100 + int(min(50, v_min / 10))
+        can_post_now = True
+        recommended_batch_size = 6
+    elif v_min >= 25 or (total_views >= 300000 and v_min >= 10):
+        # Conta com tração moderada ou conta grande esfriando (ex: @florindaadonaa)
+        if activity_index_pct < 25 and total_views >= 500000:
+            action_code = "REACTIVATE_CHAMPION"
+            action_badge = "warning"
+            action_title = "🎯 LOTE CURTO DE REATIVAÇÃO (3 VÍDEOS)"
+            action_detail = (
+                f"Conta gigante ({format_number_br(total_views)} views), mas operando a {activity_index_pct:.0f}% do pico "
+                f"(último post {last_post_age_str}). Suba apenas 3 criativos campeões de outras contas."
+            )
+            priority_score = 82
+            can_post_now = True
+            recommended_batch_size = 3
+        else:
+            action_code = "FEED_WARM"
+            action_badge = "success"
+            action_title = "🚀 ALIMENTAR CONTA (LOTE 4–5 VÍDEOS)"
+            action_detail = (
+                f"Tração ativa ({format_rate_br(v_hour)}/h) e janela livre ({last_post_age_str}). "
+                f"Boa candidata para lote regular."
+            )
+            priority_score = 88
+            can_post_now = True
+            recommended_batch_size = 5
+    else:
+        action_code = "LOW_TRACTION"
+        action_badge = "warning"
+        action_title = "🧪 TESTE ISOLADO (1–2 VÍDEOS)"
+        action_detail = (
+            f"Baixa velocidade atual ({format_rate_br(v_min)}/min). Não envie lotes grandes; "
+            f"teste 1 ou 2 vídeos no horário de pico ({best_window_str})."
+        )
+        priority_score = 25
+        can_post_now = True
+        recommended_batch_size = 2
+
+    return {
+        "activity_index_pct": activity_index_pct,
+        "accel_ratio": accel_ratio,
+        "trend_label": trend_label,
+        "trend_color": trend_color,
+        "hit_rate_10k_pct": hit_rate_10k_pct,
+        "hits_10k": hits_10k,
+        "virals_100k": virals_100k,
+        "dead_posts_count": dead_posts_count,
+        "dead_rate_pct": dead_rate_pct,
+        "top_post_share_pct": top_post_share_pct,
+        "followers_per_1k_views": followers_per_1k_views,
+        "best_window_str": best_window_str,
+        "last_post_age_str": last_post_age_str,
+        "mins_since_last_post": mins_since_last_post,
+        "recent_batch_count_3h": recent_batch_count_3h,
+        "recent_batch_views_3h": recent_batch_views_3h,
+        "action_code": action_code,
+        "action_badge": action_badge,
+        "action_title": action_title,
+        "action_detail": action_detail,
+        "priority_score": priority_score,
+        "can_post_now": can_post_now,
+        "recommended_batch_size": recommended_batch_size
+    }
+
+
+def _parse_ig_post_timestamp_to_ts_and_str(raw_ts):
+    return _parse_ig_post_timestamp_to_brt(raw_ts)
 
 
 # ==============================================================================
@@ -291,12 +627,9 @@ def load_state_from_upstash():
 
     ok, raw_state = upstash_command("GET", REDIS_STATE_KEY)
     if not ok:
-        # Falha de rede ou credencial: retorna False para NÃO marcar REDIS_BOOTSTRAPPED
-        # e impedir que a instância sobrescreva o Redis com dados zerados!
         return False, {}
 
     if raw_state is None:
-        # Chave ainda não existe no banco (primeiro uso real), mas a comunicação funcionou
         return True, {}
 
     if isinstance(raw_state, str):
@@ -324,8 +657,6 @@ def save_state_to_upstash(state_data):
         return False
 
     try:
-        # Se por algum motivo esta instância ainda não leu o Redis com sucesso,
-        # obriga a ler agora antes de salvar para NUNCA perder dados antigos de contas caídas.
         if not REDIS_BOOTSTRAPPED:
             ok_read, remote_state = load_state_from_upstash()
             if not ok_read:
@@ -336,7 +667,6 @@ def save_state_to_upstash(state_data):
                 )
                 return False
 
-            # Mescla imediatamente os dados remotos na memória antes de prosseguir
             remote_accs = remote_state.get("accounts", {}) if isinstance(remote_state, dict) else {}
             if isinstance(remote_accs, dict):
                 for r_uid, r_acc in remote_accs.items():
@@ -354,7 +684,6 @@ def save_state_to_upstash(state_data):
         new_accs = state_data.get("accounts", {}) if isinstance(state_data.get("accounts"), dict) else {}
         cleaned_accs = {}
 
-        # Garante que todas as contas da memória + novas contas sejam preservadas pelo maior valor
         all_uids = set(MEMORY_CACHE_ACCOUNTS.keys()) | set(str(k) for k in new_accs.keys())
         for uid_str in all_uids:
             mem_acc = MEMORY_CACHE_ACCOUNTS.get(uid_str, {})
@@ -442,6 +771,7 @@ def merge_best_account_data(base_acc, new_acc):
     Combina duas versões dos dados de uma mesma conta garantindo que NUNCA
     se percam seguidores, visualizações, recordes de velocidade ou lista de posts
     caso uma fonte esteja zerada. Usa sempre max() entre o histórico salvo e a leitura nova.
+    Também rastreia o ganho recente de views por post (`recent_views_gain`).
     """
     if not isinstance(base_acc, dict):
         base_acc = {}
@@ -453,7 +783,6 @@ def merge_best_account_data(base_acc, new_acc):
         if v is not None and v != "":
             merged[k] = v
 
-    # NUNCA permite que seguidores, views ou media_count diminuam para zero
     old_followers = _safe_int(base_acc.get("followers_count"))
     new_followers = _safe_int(new_acc.get("followers_count"))
     merged["followers_count"] = max(old_followers, new_followers)
@@ -466,7 +795,6 @@ def merge_best_account_data(base_acc, new_acc):
     new_media = _safe_int(new_acc.get("media_count"))
     merged["media_count"] = max(old_media, new_media)
 
-    # Mescla a lista de posts preservando todos os posts já vistos e o maior número de views de cada um
     old_posts = base_acc.get("posts_list") if isinstance(base_acc.get("posts_list"), list) else []
     new_posts = new_acc.get("posts_list") if isinstance(new_acc.get("posts_list"), list) else []
 
@@ -482,27 +810,33 @@ def merge_best_account_data(base_acc, new_acc):
         for p in new_posts:
             if isinstance(p, dict) and p.get("id"):
                 pid = str(p["id"])
+                new_v = _safe_int(p.get("views"))
                 if pid in posts_by_id:
+                    old_v = _safe_int(posts_by_id[pid].get("views"))
+                    prev_gain = _safe_int(posts_by_id[pid].get("recent_views_gain"))
                     best_p = dict(posts_by_id[pid])
                     best_p.update(p)
-                    best_p["views"] = max(_safe_int(posts_by_id[pid].get("views")), _safe_int(p.get("views")))
+                    best_p["views"] = max(old_v, new_v)
+                    if new_v > old_v and old_v > 0:
+                        best_p["recent_views_gain"] = (new_v - old_v)
+                    else:
+                        best_p["recent_views_gain"] = max(prev_gain, _safe_int(p.get("recent_views_gain")))
                     posts_by_id[pid] = best_p
                 else:
                     p_copy = dict(p)
-                    p_copy["views"] = _safe_int(p.get("views"))
+                    p_copy["views"] = new_v
+                    p_copy["recent_views_gain"] = _safe_int(p.get("recent_views_gain"))
                     posts_by_id[pid] = p_copy
 
         merged_posts_list = sorted(posts_by_id.values(), key=lambda x: _safe_int(x.get("views")), reverse=True)
         merged["posts_list"] = merged_posts_list
 
-        # Garante que total_views nunca seja menor que a soma dos posts salvos
         sum_posts_views = sum(_safe_int(x.get("views")) for x in merged_posts_list)
         merged["total_views"] = max(merged["total_views"], sum_posts_views)
         merged["media_count"] = max(merged["media_count"], len(merged_posts_list))
     else:
         merged["posts_list"] = []
 
-    # Preserva o horário real da última coleta válida se a conta tiver caído
     old_ts = str(base_acc.get("metrics_updated_at") or "").strip()
     new_ts = str(new_acc.get("metrics_updated_at") or "").strip()
     invalid_markers = ("", "—", "Sem coleta antes da queda")
@@ -513,13 +847,11 @@ def merge_best_account_data(base_acc, new_acc):
     else:
         merged["metrics_updated_at"] = old_ts or new_ts or "—"
 
-    # Preserva o username real (nunca troca um @username válido por user_123456)
     old_user = str(base_acc.get("username") or "").strip()
     new_user = str(new_acc.get("username") or "").strip()
     if (not new_user or new_user.startswith("user_")) and old_user and not old_user.startswith("user_"):
         merged["username"] = old_user
 
-    # Mescla o histórico de pontos de visualizações e recalcula Views/Min e Views/Hora ATUAIS
     snap_ts = _parse_br_datetime_to_ts(merged.get("metrics_updated_at"))
     merged["views_history"] = _merge_views_history(
         base_acc.get("views_history"),
@@ -531,7 +863,6 @@ def merge_best_account_data(base_acc, new_acc):
     merged["views_per_min"] = v_min
     merged["views_per_hour"] = v_hour
 
-    # Preserva e atualiza o RECORDE de Views/Min e Views/Hora de cada conta (nunca diminui)
     prev_peak_min = max(
         _safe_float(base_acc.get("peak_views_per_min")),
         _safe_float(new_acc.get("peak_views_per_min"))
@@ -685,7 +1016,6 @@ def get_saved_state(force_redis=False):
                 uid_s = str(uid).strip()
                 merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), acc)
 
-        # Atualiza a memória RAM com o melhor estado consolidado
         for uid, acc in merged_accounts.items():
             MEMORY_CACHE_ACCOUNTS[str(uid)] = acc
 
@@ -727,14 +1057,11 @@ def save_current_state(state_data):
                     )
                 state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
 
-        # 1. Salva no Upstash Redis (com trava anti-sobrescrita a frio)
         if is_upstash_configured():
             save_state_to_upstash(state_data)
 
-        # 2. Salva no arquivo de runtime (/tmp na Vercel ou local)
         save_json(RUNTIME_ACCOUNTS_FILE, state_data)
 
-        # 3. Se a pasta do projeto tiver permissão de escrita (PC local ou VPS), salva nela também
         if RUNTIME_ACCOUNTS_FILE != BUNDLED_MONITOR_FILE and os.access(BASE_DIR, os.W_OK):
             save_json(BUNDLED_MONITOR_FILE, state_data)
 
@@ -1043,6 +1370,10 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         str(p.get("id")): _safe_int(p.get("views"))
         for p in prev_posts_list if isinstance(p, dict) and p.get("id")
     }
+    prev_gain_by_post_id = {
+        str(p.get("id")): _safe_int(p.get("recent_views_gain"))
+        for p in prev_posts_list if isinstance(p, dict) and p.get("id")
+    }
 
     total_views = 0
     media_views_map = {}
@@ -1084,8 +1415,11 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
 
     posts_ranked = []
     for m_item in all_media:
-        mid = m_item.get("id", "")
-        v_count = int(media_views_map.get(mid, prev_views_by_post_id.get(str(mid), 0)))
+        mid = str(m_item.get("id", ""))
+        old_v = prev_views_by_post_id.get(mid, 0)
+        v_count = int(media_views_map.get(mid, old_v))
+        recent_gain = (v_count - old_v) if (v_count > old_v and old_v > 0) else prev_gain_by_post_id.get(mid, 0)
+
         shortcode = m_item.get("shortcode", "")
         permalink = (m_item.get("permalink") or "").strip()
         if not permalink and shortcode:
@@ -1105,12 +1439,16 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         posts_ranked.append({
             "id": mid,
             "views": v_count,
+            "recent_views_gain": recent_gain,
             "permalink": permalink or reels_link,
             "reels_url": reels_link or permalink,
             "shortcode": shortcode,
             "caption": short_caption,
             "media_type": m_item.get("media_product_type") or m_item.get("media_type") or "REELS",
-            "timestamp": ts_fmt
+            "timestamp": ts_fmt,
+            "timestamp_raw": ts_raw,
+            "like_count": _safe_int(m_item.get("like_count")),
+            "comments_count": _safe_int(m_item.get("comments_count"))
         })
 
     posts_ranked.sort(key=lambda x: _safe_int(x.get("views")), reverse=True)
@@ -1146,7 +1484,6 @@ def refresh_all_accounts_to_json():
     tudo no Upstash Redis com 1 único comando SET ao final.
     """
     with SYNC_LOCK:
-        # 1. Obriga a carregar do Upstash primeiro se ainda não tiver feito bootstrap com sucesso
         saved_state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
         saved_accounts = saved_state.get("accounts", {}) if isinstance(saved_state, dict) else {}
         env_accounts = get_env_accounts()
@@ -1200,7 +1537,6 @@ def refresh_all_accounts_to_json():
 # ==============================================================================
 
 def background_5min_loop():
-    # Aguarda 5 segundos no boot para não disputar corrida com a primeira requisição HTTP
     time.sleep(5)
     while True:
         try:
@@ -1222,7 +1558,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (CONTAS ORDENADAS POR VIEWS + VIEWS ATUAIS + RECORDES)
+# TEMPLATE HTML (COM PAINEL TÁTICO DE ALOCAÇÃO DE LOTES + DIAGNÓSTICO DE TRAÇÃO)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -1231,7 +1567,7 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Monitor 24h — Contas Conectadas (Ordenadas por Visualizações)</title>
+    <title>Monitor 24h & Inteligência de Tração — Contas Conectadas</title>
     <style>
         :root {
             --bg: #0f172a;
@@ -1245,20 +1581,20 @@ HTML_TEMPLATE = r"""
             --error: #ef4444;
         }
         * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
-        body { background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
-        .container { max-width: 1420px; margin: 0 auto; display: grid; gap: 20px; }
-        .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
-        h1, h2 { margin: 0; }
+        body { background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+        .container { max-width: 1620px; margin: 0 auto; display: grid; gap: 18px; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+        h1, h2, h3 { margin: 0; }
         .hint { font-size: 0.82rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
-        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.86rem; }
-        th, td { border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; vertical-align: middle; }
-        th { color: var(--muted); }
-        .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; display: inline-block; }
-        .badge.success { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-        .badge.warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-        .badge.info { background: rgba(56, 189, 248, 0.2); color: #38bdf8; }
-        .badge.error { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-        .metric-val { font-weight: 700; color: #f8fafc; font-size: 0.94rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.84rem; }
+        th, td { border-bottom: 1px solid var(--border); padding: 10px 7px; text-align: left; vertical-align: middle; }
+        th { color: var(--muted); font-weight: 600; }
+        .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 600; display: inline-block; }
+        .badge.success { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.35); }
+        .badge.warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+        .badge.info { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); }
+        .badge.error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }
+        .metric-val { font-weight: 700; color: #f8fafc; font-size: 0.93rem; }
         button.small-btn {
             margin-top: 0; padding: 7px 13px; width: auto; font-size: 0.82rem; border-radius: 6px;
             background: #3b82f6; color: white; border: none; font-weight: 600; cursor: pointer; transition: 0.2s;
@@ -1287,15 +1623,13 @@ HTML_TEMPLATE = r"""
             color: #ffffff;
             border-color: #38bdf8;
         }
-        .posts-dropdown-row {
-            background: #0b1120;
-        }
+        .posts-dropdown-row { background: #0b1120; }
         .posts-dropdown-box {
             padding: 12px 14px;
             border-radius: 8px;
             background: #111a2e;
             border: 1px solid var(--border);
-            max-height: 280px;
+            max-height: 320px;
             overflow-y: auto;
         }
         .post-rank-item {
@@ -1305,11 +1639,9 @@ HTML_TEMPLATE = r"""
             gap: 12px;
             padding: 8px 10px;
             border-bottom: 1px solid #1e293b;
-            font-size: 0.84rem;
+            font-size: 0.83rem;
         }
-        .post-rank-item:last-child {
-            border-bottom: none;
-        }
+        .post-rank-item:last-child { border-bottom: none; }
         .post-rank-link {
             color: #38bdf8;
             text-decoration: none;
@@ -1324,7 +1656,7 @@ HTML_TEMPLATE = r"""
             display: flex;
             gap: 14px;
             flex-wrap: wrap;
-            font-size: 0.86rem;
+            font-size: 0.85rem;
             color: var(--muted);
             margin-top: 8px;
             align-items: center;
@@ -1336,15 +1668,63 @@ HTML_TEMPLATE = r"""
             border-radius: 8px;
             color: #fde68a;
         }
+        .intel-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+            gap: 14px;
+            margin-top: 12px;
+        }
+        .intel-box {
+            background: #0f172a;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 13px 15px;
+        }
+        .intel-box h3 {
+            font-size: 0.92rem;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .intel-item {
+            font-size: 0.82rem;
+            padding: 6px 0;
+            border-bottom: 1px dashed #1e293b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+        }
+        .intel-item:last-child { border-bottom: none; }
+        .progress-bar-bg {
+            width: 100%;
+            height: 6px;
+            background: #0f172a;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 4px;
+            border: 1px solid #334155;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+        }
+        .sub-meta {
+            color: var(--muted);
+            font-size: 0.75rem;
+            display: block;
+            margin-top: 2px;
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
         <div>
-            <h1>Painel de Monitoramento 24h (Ordenado por Visualizações)</h1>
+            <h1>Painel de Monitoramento 24h & Inteligência de Tração</h1>
             <div class="hint">
-                🔒 <b>Proteção Anti-Zeramento Ativa:</b> Se uma conta cair ou bloquear a API, os últimos seguidores, visualizações, recordes de velocidade e lista de posts ficam salvos no <b>Upstash Redis</b> e nunca são zerados.
+                🔒 <b>Proteção Anti-Zeramento + Alocação Inteligente:</b> O sistema cruza a aceleração em tempo real (<code>Views/Min</code> vs <code>Recorde</code>) com o tempo de maturação do último lote (corrigido para BRT) para indicar <b>onde postar agora</b> e <b>onde aguardar para não canibalizar</b>.
             </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
@@ -1370,29 +1750,103 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
-    <!-- 3. CONTAS CONECTADAS (ORDENADAS DA MAIOR VISUALIZAÇÃO NO TOPO PARA A MENOR EMBAIXO) -->
+    <!-- CENTRAL DE COMANDO E ALOCAÇÃO DE LOTES (MOTOR INTELIGENTE) -->
+    <div class="card" style="border-color:#3b82f6;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <div>
+                <h2 style="color:#60a5fa;">🧠 Central Tática de Alocação de Lotes (Anti-Canibalização & Tração)</h2>
+                <div class="hint">
+                    Decisão automatizada cruzando <b>Velocidade Atual</b>, <b>Índice de Atividade (Recorde)</b> e <b>Janela de Maturação de 120 min</b> do último lote.
+                </div>
+            </div>
+            <span class="badge info">API Automação: <code>/api/smart_queue</code></span>
+        </div>
+
+        <div class="intel-grid">
+            <!-- COLUNA 1: CONTAS PRONTAS PARA RECEBER LOTE AGORA -->
+            <div class="intel-box" style="border-color:rgba(34,197,94,0.4);">
+                <h3 style="color:#4ade80;">🔥 Prontas p/ Lote Agora (Surfar Tração / Reativar)</h3>
+                {% if ready_to_post_list %}
+                    {% for item in ready_to_post_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">{{ item.intel.action_title }} • Último post {{ item.intel.last_post_age_str }}</span>
+                        </div>
+                        <div style="text-align:right;">
+                            <span class="badge success">{{ item.views_per_min | fmt_rate }}/min</span>
+                            <span class="sub-meta">Sugerido: <b>{{ item.intel.recommended_batch_size }} vídeos</b></span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Nenhuma conta livre com alta tração neste minuto (verifique as contas em maturação ao lado).</div>
+                {% endif %}
+            </div>
+
+            <!-- COLUNA 2: CONTAS EM COOLDOWN ANTI-CANIBALIZAÇÃO -->
+            <div class="intel-box" style="border-color:rgba(245,158,11,0.4);">
+                <h3 style="color:#fbbf24;">⏳ Em Maturação de Lote (Não Postar Por Cima!)</h3>
+                {% if maturing_cooldown_list %}
+                    {% for item in maturing_cooldown_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">
+                                Lote {{ item.intel.last_post_age_str }} ({{ item.intel.recent_batch_count_3h }} vídeos = +{{ item.intel.recent_batch_views_3h | fmt_num }} views)
+                            </span>
+                        </div>
+                        <div style="text-align:right;">
+                            <span class="badge warning">{{ item.views_per_min | fmt_rate }}/min</span>
+                            <span class="sub-meta" style="color:#fbbf24;">Aguardar {{ 120 - (item.intel.mins_since_last_post or 0) }} min</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Nenhuma conta com lote recém-postado nos últimos 120 minutos.</div>
+                {% endif %}
+            </div>
+
+            <!-- COLUNA 3: CONTAS ZUMBIS / PAUSAR OU RECONECTAR -->
+            <div class="intel-box" style="border-color:rgba(239,68,68,0.4);">
+                <h3 style="color:#f87171;">🛑 Pausar Criativos (Zumbis) ou Reconectar</h3>
+                {% if paused_or_down_list %}
+                    {% for item in paused_or_down_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">{{ item.intel.action_title }}</span>
+                        </div>
+                        <div style="text-align:right;">
+                            <span class="badge {{ item.intel.action_badge }}">{{ item.total_views | fmt_num }} views</span>
+                            <span class="sub-meta">{{ item.media_count }} posts</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Todas as contas estão saudáveis e entregando normalmente.</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- TABELA PRINCIPAL DE CONTAS CONECTADAS -->
     <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
             <div>
-                <h2>3. Contas Conectadas ({{ accounts|length }}) — Mais Visualizações no Topo ↓</h2>
+                <h2>Contas Conectadas ({{ accounts|length }}) — Ordenadas por Visualizações ↓</h2>
                 <div class="top-stats-bar">
                     <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
                     <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
-                    <span>Views / Min Atuais (Total): <b style="color:#fbbf24;">{{ total_views_per_min | fmt_rate }}/min</b></span>
-                    <span>Views / Hora Atuais (Total): <b style="color:#c084fc;">{{ total_views_per_hour | fmt_rate }}/h</b></span>
+                    <span>Views / Min Atuais: <b style="color:#fbbf24;">{{ total_views_per_min | fmt_rate }}/min</b></span>
+                    <span>Views / Hora Atuais: <b style="color:#c084fc;">{{ total_views_per_hour | fmt_rate }}/h</b></span>
                     <span class="record-pill">
-                        🏆 Recorde Melhor Conta (Min):
-                        <b style="color:#fbbf24;">{{ best_record_min_val | fmt_rate }}/min</b>
-                        {% if best_record_min_user %}
-                        <span style="color:#94a3b8;">(@{{ best_record_min_user }})</span>
-                        {% endif %}
+                        🏆 Recorde Min: <b style="color:#fbbf24;">{{ best_record_min_val | fmt_rate }}/min</b>
+                        {% if best_record_min_user %}<span style="color:#94a3b8;">(@{{ best_record_min_user }})</span>{% endif %}
                     </span>
                     <span class="record-pill">
-                        🏆 Recorde Melhor Conta (Hora):
-                        <b style="color:#f472b6;">{{ best_record_hour_val | fmt_rate }}/h</b>
-                        {% if best_record_hour_user %}
-                        <span style="color:#94a3b8;">(@{{ best_record_hour_user }})</span>
-                        {% endif %}
+                        🏆 Recorde Hora: <b style="color:#f472b6;">{{ best_record_hour_val | fmt_rate }}/h</b>
+                        {% if best_record_hour_user %}<span style="color:#94a3b8;">(@{{ best_record_hour_user }})</span>{% endif %}
                     </span>
                 </div>
             </div>
@@ -1411,74 +1865,116 @@ HTML_TEMPLATE = r"""
             <table>
                 <thead>
                     <tr>
-                        <th style="width:85px; text-align:center;">Rank / Posts</th>
+                        <th style="width:78px; text-align:center;">Rank / Posts</th>
                         <th>@Username</th>
-                        <th>Status da Conta (Instagram)</th>
-                        <th>Seguidores</th>
-                        <th>Visualizações Totais (Posts) ↓</th>
+                        <th>Status API</th>
+                        <th>Seguidores & Conv.</th>
+                        <th>Visualizações Totais ↓</th>
                         <th>Views / Min (Atual)</th>
                         <th>Views / Hora (Atual)</th>
-                        <th>🏆 Recorde / Min</th>
-                        <th>🏆 Recorde / Hora</th>
-                        <th>IG User ID</th>
-                        <th>Etiqueta</th>
-                        <th>Última Coleta Válida</th>
-                        <th>Status do Token</th>
+                        <th>🏆 Recordes (Min / Hora)</th>
+                        <th style="min-width:135px;">Índice Atividade & Ritmo</th>
+                        <th>Último Lote & Janela Pico</th>
+                        <th style="min-width:230px;">🧠 Recomendação Operacional</th>
+                        <th>Última Coleta</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for acc_id, acc in accounts.items() %}
                     {% set posts_ordenados = acc.get('posts_list', []) %}
+                    {% set intel = acc.get('intel', {}) %}
                     <tr>
                         <td style="text-align:center; white-space:nowrap;">
                             <div style="display:inline-flex; align-items:center; gap:6px;">
-                                <span class="badge info" style="min-width:32px; text-align:center;">#{{ loop.index }}</span>
-                                <button type="button" id="btn_toggle_{{ acc_id }}" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts ordenados por visualizações (maior no topo)">
+                                <span class="badge info" style="min-width:30px; text-align:center;">#{{ loop.index }}</span>
+                                <button type="button" id="btn_toggle_{{ acc_id }}" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts e diagnóstico de retenção">
                                     ↓
                                 </button>
                             </div>
                         </td>
-                        <td><b>@{{ acc.username }}</b></td>
+                        <td>
+                            <b>@{{ acc.username }}</b>
+                            <span class="sub-meta">ID: {{ acc.ig_user_id }}</span>
+                        </td>
                         <td>
                             <span class="badge {{ acc.get('account_status_badge', 'success') }}" title="{{ acc.get('account_status_detail', '') }}">
                                 {{ acc.get('account_status', 'Ativa') }}
                             </span>
+                            <span class="sub-meta">{{ acc.get('account_status_detail', '') }}</span>
                         </td>
                         <td>
                             <span class="metric-val">{{ acc.get('followers_count') | fmt_num }}</span>
+                            <span class="sub-meta" title="Seguidores ganhos a cada 1.000 visualizações">
+                                🎯 {{ intel.get('followers_per_1k_views', 0) }} seg / 1k views
+                            </span>
                         </td>
                         <td>
                             <span class="metric-val" style="color:#38bdf8;">{{ acc.get('total_views') | fmt_num }}</span>
-                            {% if acc.get('media_count') is not none %}
-                            <span style="color:var(--muted); font-size:0.78rem; display:block;">({{ acc.get('media_count') }} post(s))</span>
-                            {% endif %}
+                            <span class="sub-meta">
+                                {{ acc.get('media_count', 0) }} posts • 🏆 {{ intel.get('hits_10k', 0) }} hits (+10k)
+                            </span>
                         </td>
                         <td>
                             <span class="metric-val" style="color:#fbbf24;">{{ acc.get('views_per_min', 0) | fmt_rate }}/min</span>
+                            <span class="sub-meta" style="color:{{ intel.get('trend_color', '#94a3b8') }}; font-weight:600;">
+                                {{ intel.get('trend_label', '—') }}
+                            </span>
                         </td>
                         <td>
                             <span class="metric-val" style="color:#c084fc;">{{ acc.get('views_per_hour', 0) | fmt_rate }}/h</span>
                         </td>
                         <td>
-                            <span class="metric-val" style="color:#fde047;">{{ acc.get('peak_views_per_min', 0) | fmt_rate }}/min</span>
+                            <span style="color:#fde047; font-weight:700;">{{ acc.get('peak_views_per_min', 0) | fmt_rate }}/m</span>
+                            <span class="sub-meta" style="color:#f472b6; font-weight:600;">
+                                {{ acc.get('peak_views_per_hour', 0) | fmt_rate }}/h
+                            </span>
                         </td>
                         <td>
-                            <span class="metric-val" style="color:#f472b6;">{{ acc.get('peak_views_per_hour', 0) | fmt_rate }}/h</span>
+                            <div style="display:flex; justify-content:space-between; font-size:0.78rem;">
+                                <span>Saúde vs Pico:</span>
+                                <b style="color:#f8fafc;">{{ intel.get('activity_index_pct', 0) }}%</b>
+                            </div>
+                            <div class="progress-bar-bg">
+                                <div class="progress-bar-fill" style="width:{{ intel.get('activity_index_pct', 0) }}%; background:{% if intel.get('activity_index_pct', 0) >= 60 %}#22c55e{% elif intel.get('activity_index_pct', 0) >= 20 %}#38bdf8{% else %}#ef4444{% endif %};"></div>
+                            </div>
+                            <span class="sub-meta">
+                                Top 1 post = {{ intel.get('top_post_share_pct', 0) }}% das views
+                            </span>
                         </td>
-                        <td>{{ acc.ig_user_id }}</td>
-                        <td>{{ acc.label }}</td>
-                        <td>{{ acc.get('metrics_updated_at', '—') }}</td>
-                        <td><span class="badge success">{{ acc.get('token_type_label', 'Longa Duração (60 dias)') }}</span></td>
+                        <td>
+                            <b style="color:#e2e8f0; font-size:0.81rem;">Último: {{ intel.get('last_post_age_str', '—') }}</b>
+                            {% if intel.get('recent_batch_count_3h', 0) > 0 %}
+                            <span class="sub-meta" style="color:#4ade80;">
+                                Lote 3h: {{ intel.get('recent_batch_count_3h') }} posts (+{{ intel.get('recent_batch_views_3h') | fmt_num }} v)
+                            </span>
+                            {% endif %}
+                            <span class="sub-meta" style="color:#38bdf8;">
+                                ⏰ {{ intel.get('best_window_str', '—') }}
+                            </span>
+                        </td>
+                        <td>
+                            <span class="badge {{ intel.get('action_badge', 'info') }}">
+                                {{ intel.get('action_title', '—') }}
+                            </span>
+                            <span class="sub-meta" style="max-width:265px; white-space:normal; line-height:1.3;">
+                                {{ intel.get('action_detail', '') }}
+                            </span>
+                        </td>
+                        <td>
+                            <span style="font-size:0.8rem;">{{ acc.get('metrics_updated_at', '—') }}</span>
+                        </td>
                     </tr>
                     <tr id="posts_row_{{ acc_id }}" class="posts-dropdown-row" style="display:none;">
-                        <td colspan="13" style="padding:10px 16px;">
+                        <td colspan="12" style="padding:10px 16px;">
                             <div class="posts-dropdown-box">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
                                     <b style="color:#38bdf8; font-size:0.88rem;">
-                                        📊 Posts / Reels de @{{ acc.username }} — Ordenados por Visualizações (Maior no topo ↓ Menor embaixo)
+                                        📊 Posts / Reels de @{{ acc.username }} — Diagnóstico de Tração, Ganho Recente e Horário Real (BRT)
                                     </b>
                                     <span style="color:var(--muted); font-size:0.78rem;">
-                                        Total listado: {{ posts_ordenados|length }} post(s)
+                                        Total: {{ posts_ordenados|length }} post(s) |
+                                        🏆 Hits +10k: <b>{{ intel.get('hits_10k', 0) }} ({{ intel.get('hit_rate_10k_pct', 0) }}%)</b> |
+                                        💀 Morte Súbita (&lt;400 views após 2h): <b>{{ intel.get('dead_posts_count', 0) }}</b>
                                     </span>
                                 </div>
                                 {% if posts_ordenados %}
@@ -1486,17 +1982,25 @@ HTML_TEMPLATE = r"""
                                     <div class="post-rank-item">
                                         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                                             <span class="badge info" style="min-width:34px; text-align:center;">#{{ loop.index }}</span>
-                                            <span style="font-weight:700; color:#4ade80; min-width:115px;">
+                                            <span style="font-weight:700; color:#4ade80; min-width:120px;">
                                                 👁️ {{ p.get('views', 0) | fmt_num }} views
+                                            </span>
+                                            {% if p.get('recent_views_gain', 0) > 0 %}
+                                            <span class="badge success" title="Visualizações ganhas desde a última sincronização">
+                                                +{{ p.get('recent_views_gain') | fmt_num }} agora
+                                            </span>
+                                            {% endif %}
+                                            <span class="badge {{ p.get('diag_badge', 'info') }}">
+                                                {{ p.get('diag_label', '—') }}
                                             </span>
                                             <a href="{{ p.get('reels_url') or p.get('permalink') or '#' }}" target="_blank" rel="noopener noreferrer" class="post-rank-link">
                                                 🔗 {{ p.get('reels_url') or p.get('permalink') or ('ID: ' ~ p.get('id')) }}
                                             </a>
                                         </div>
-                                        <div style="color:var(--muted); font-size:0.78rem; text-align:right;">
-                                            {{ p.get('caption', '') }}
-                                            {% if p.get('timestamp') %}
-                                            <span style="margin-left:6px; color:#64748b;">({{ p.get('timestamp') }})</span>
+                                        <div style="color:var(--muted); font-size:0.78rem; text-align:right; white-space:nowrap;">
+                                            <span>⏳ Idade: <b style="color:#e2e8f0;">{{ p.get('age_human', '—') }}</b></span>
+                                            {% if p.get('timestamp_brt') %}
+                                            <span style="margin-left:8px; color:#94a3b8;">(📅 {{ p.get('timestamp_brt') }} BRT)</span>
                                             {% endif %}
                                         </div>
                                     </div>
@@ -1588,13 +2092,12 @@ HTML_TEMPLATE = r"""
 
 
 # ==============================================================================
-# ROTAS FLASK
+# ROTAS FLASK E API DE FILA INTELIGENTE
 # ==============================================================================
 
 @app.route("/", methods=["GET"])
 @requires_auth
 def index():
-    # Se ainda não inicializou do Upstash nesta instância, força a leitura primeiro
     state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     last_ts = state.get("last_global_sync_ts", 0)
     accounts = state.get("accounts", {})
@@ -1610,7 +2113,10 @@ def index():
     best_record_hour_val = 0.0
     best_record_hour_user = ""
 
-    # Garante que todas as contas tenham views_per_min, views_per_hour e recordes atualizados
+    ready_to_post_list = []
+    maturing_cooldown_list = []
+    paused_or_down_list = []
+
     for acc in accounts.values():
         if isinstance(acc, dict):
             v_min, v_hour = _compute_account_velocity_rates(acc)
@@ -1622,6 +2128,17 @@ def index():
             acc["peak_views_per_min"] = peak_min
             acc["peak_views_per_hour"] = peak_hour
 
+            intel = _analyze_account_intelligence(acc)
+            acc["intel"] = intel
+
+            acode = intel.get("action_code", "")
+            if acode in ("SURF_TRACTION", "FEED_WARM", "REACTIVATE_CHAMPION"):
+                ready_to_post_list.append(acc)
+            elif acode in ("COOLDOWN_HOT", "COOLDOWN_MATURING"):
+                maturing_cooldown_list.append(acc)
+            elif acode in ("PAUSE_ZOMBIE", "RECONNECT", "QUOTA_FULL"):
+                paused_or_down_list.append(acc)
+
             uname = str(acc.get("username") or "").strip()
             if peak_min > best_record_min_val:
                 best_record_min_val = peak_min
@@ -1629,6 +2146,8 @@ def index():
             if peak_hour > best_record_hour_val:
                 best_record_hour_val = peak_hour
                 best_record_hour_user = uname
+
+    ready_to_post_list.sort(key=lambda x: x.get("intel", {}).get("priority_score", 0), reverse=True)
 
     total_followers = sum(_safe_int(acc.get("followers_count")) for acc in accounts.values())
     total_views = sum(_safe_int(acc.get("total_views")) for acc in accounts.values())
@@ -1647,9 +2166,55 @@ def index():
         best_record_min_user=best_record_min_user,
         best_record_hour_val=best_record_hour_val,
         best_record_hour_user=best_record_hour_user,
+        ready_to_post_list=ready_to_post_list,
+        maturing_cooldown_list=maturing_cooldown_list,
+        paused_or_down_list=paused_or_down_list,
         upstash_active=is_upstash_configured(),
         redis_bootstrapped=REDIS_BOOTSTRAPPED
     )
+
+
+@app.route("/api/smart_queue", methods=["GET"])
+@requires_auth
+def api_smart_queue():
+    """
+    Endpoint JSON pronto para integrar ao seu publicador local:
+    Retorna a fila priorizada de contas indicando quais podem receber lote agora
+    (`can_post_now: true`), o tamanho recomendado do lote e quais devem aguardar cooldown.
+    """
+    state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
+    accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
+    queue = []
+
+    for uid, acc in accounts.items():
+        if not isinstance(acc, dict):
+            continue
+        v_min, v_hour = _compute_account_velocity_rates(acc)
+        acc["views_per_min"] = v_min
+        acc["views_per_hour"] = v_hour
+        intel = _analyze_account_intelligence(acc)
+        queue.append({
+            "ig_user_id": uid,
+            "username": acc.get("username"),
+            "can_post_now": intel.get("can_post_now", False),
+            "recommended_batch_size": intel.get("recommended_batch_size", 0),
+            "priority_score": intel.get("priority_score", 0),
+            "action_code": intel.get("action_code"),
+            "action_title": intel.get("action_title"),
+            "action_detail": intel.get("action_detail"),
+            "views_per_min": v_min,
+            "views_per_hour": v_hour,
+            "activity_index_pct": intel.get("activity_index_pct"),
+            "mins_since_last_post": intel.get("mins_since_last_post"),
+            "best_window_brt": intel.get("best_window_str")
+        })
+
+    queue.sort(key=lambda x: x["priority_score"], reverse=True)
+    return jsonify({
+        "generated_at_brt": datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+        "accounts_ready_count": sum(1 for x in queue if x["can_post_now"]),
+        "smart_queue": queue
+    })
 
 
 @app.route("/atualizar_metricas", methods=["GET", "POST"])
@@ -1662,10 +2227,6 @@ def atualizar_metricas():
 @app.route("/api/export_snapshot", methods=["GET"])
 @requires_auth
 def export_snapshot():
-    """
-    Exporta o dicionário completo combinando os access_tokens de ACCOUNTS_CONFIG_JSON
-    com as últimas métricas e posts coletados.
-    """
     env_accs = get_env_accounts()
     state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     saved_accs = state.get("accounts", {})
