@@ -56,13 +56,231 @@ def format_number_br(val):
     if val is None or val == "":
         return "—"
     try:
-        n = int(val)
+        n = int(round(float(val)))
         return f"{n:,}".replace(",", ".")
     except Exception:
         return str(val)
 
 
+def format_rate_br(val):
+    """Formata taxas de visualizações por minuto/hora no padrão brasileiro."""
+    if val is None or val == "":
+        return "0"
+    try:
+        num = float(val)
+        if num <= 0:
+            return "0"
+        if num >= 100:
+            n = int(round(num))
+            return f"{n:,}".replace(",", ".")
+        if num >= 10:
+            s = f"{num:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            return s[:-2] if s.endswith(",0") else s
+        s = f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if s.endswith(",00"):
+            return s[:-3]
+        if s.endswith("0") and "," in s:
+            return s[:-1]
+        return s
+    except Exception:
+        return str(val)
+
+
 app.jinja_env.filters["fmt_num"] = format_number_br
+app.jinja_env.filters["fmt_rate"] = format_rate_br
+
+
+# ==============================================================================
+# CÁLCULO DE VISUALIZAÇÕES POR MINUTO E POR HORA (POR CONTA E GLOBAL)
+# ==============================================================================
+
+def _safe_int(val):
+    try:
+        if val is None or val == "":
+            return 0
+        if isinstance(val, str):
+            val = val.replace(".", "").replace(",", "").strip()
+        return max(0, int(float(val)))
+    except Exception:
+        return 0
+
+
+def _safe_float(val):
+    try:
+        if val is None or val == "":
+            return 0.0
+        if isinstance(val, str):
+            val = val.replace(",", ".").strip()
+        return max(0.0, float(val))
+    except Exception:
+        return 0.0
+
+
+def _parse_br_datetime_to_ts(dt_str):
+    if not dt_str or not isinstance(dt_str, str):
+        return None
+    s = dt_str.strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=BRT)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return None
+
+
+def _parse_post_timestamp_to_ts(ts_str):
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    try:
+        if "+" in s or s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.timestamp()
+        # No media fetcher, o timestamp salvo em posts_list vem em UTC ("YYYY-MM-DD HH:MM")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(s[:19], fmt).replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _merge_views_history(old_hist, new_hist, current_views=0, current_ts=None):
+    """
+    Mescla o histórico de coletas (timestamp + total_views) preservando até 288 pontos (24h).
+    Garante que o total de views na linha do tempo nunca regrida para zero.
+    """
+    by_bucket = {}
+    for src in (old_hist, new_hist):
+        if not isinstance(src, list):
+            continue
+        for item in src:
+            if not isinstance(item, dict):
+                continue
+            ts = _safe_float(item.get("ts"))
+            v = _safe_int(item.get("views"))
+            if ts > 0 and v >= 0:
+                bucket = int(ts // 30)  # agrupa leituras dentro da mesma janela de 30s
+                if bucket not in by_bucket or v > by_bucket[bucket]["views"]:
+                    by_bucket[bucket] = {"ts": round(ts, 2), "views": v}
+
+    if current_ts and current_ts > 0 and current_views > 0:
+        bucket = int(current_ts // 30)
+        if bucket not in by_bucket or current_views > by_bucket[bucket]["views"]:
+            by_bucket[bucket] = {"ts": round(float(current_ts), 2), "views": int(current_views)}
+
+    ordered = sorted(by_bucket.values(), key=lambda x: x["ts"])
+
+    # Garante monotonicidade (nunca deixa um ponto posterior ter menos views que o anterior)
+    running_max = 0
+    cleaned = []
+    for pt in ordered:
+        running_max = max(running_max, _safe_int(pt.get("views")))
+        cleaned.append({"ts": pt["ts"], "views": running_max})
+
+    # Mantém últimas 24h (ou no máximo 288 pontos de 5 min)
+    if len(cleaned) > 288:
+        cleaned = cleaned[-288:]
+    return cleaned
+
+
+def _compute_account_velocity_rates(acc_dict):
+    """
+    Calcula `views_per_min` e `views_per_hour` da conta:
+    1. Cálculo primário (Lifetime ativo dos posts / conta):
+       Baseia-se no tempo ativo desde o primeiro post registrado (ou conexão da conta)
+       até a última coleta válida (ou instante atual), garantindo valores reais imediatos.
+    2. Cálculo por janela de histórico (Delta entre coletas no Redis):
+       Se houver ganho real de visualizações registrado entre snapshots recentes no `views_history`,
+       utiliza a maior taxa entre o ganho recente e a média de vida dos posts.
+    """
+    if not isinstance(acc_dict, dict):
+        return 0.0, 0.0
+
+    total_views = _safe_int(acc_dict.get("total_views"))
+    if total_views <= 0:
+        return 0.0, 0.0
+
+    ref_end_ts = (
+        _parse_br_datetime_to_ts(acc_dict.get("metrics_updated_at"))
+        or time.time()
+    )
+
+    # 1. Descobre o timestamp do post mais antigo (ou data de conexão da conta)
+    post_timestamps = []
+    posts_list = acc_dict.get("posts_list")
+    if isinstance(posts_list, list):
+        for p in posts_list:
+            if isinstance(p, dict):
+                pts = _parse_post_timestamp_to_ts(p.get("timestamp"))
+                if pts and pts > 0:
+                    post_timestamps.append(pts)
+
+    earliest_ts = min(post_timestamps) if post_timestamps else None
+    if not earliest_ts:
+        conn_ts = _parse_br_datetime_to_ts(acc_dict.get("connected_at"))
+        if conn_ts:
+            earliest_ts = conn_ts
+
+    lifetime_vpm = 0.0
+    lifetime_vph = 0.0
+    if earliest_ts and ref_end_ts > earliest_ts:
+        elapsed_minutes = max(1.0, (ref_end_ts - earliest_ts) / 60.0)
+        elapsed_hours = max(1.0 / 60.0, elapsed_minutes / 60.0)
+        lifetime_vpm = total_views / elapsed_minutes
+        lifetime_vph = total_views / elapsed_hours
+
+    # 2. Verifica velocidade recente pelo histórico de snapshots se houver delta positivo
+    hist = acc_dict.get("views_history")
+    delta_vpm = 0.0
+    delta_vph = 0.0
+    if isinstance(hist, list) and len(hist) >= 2:
+        latest = hist[-1]
+        latest_ts = _safe_float(latest.get("ts"))
+        latest_views = _safe_int(latest.get("views"))
+
+        # Ponto de referência para taxa por minuto (pelo menos 2 min atrás)
+        ref_min_pt = hist[0]
+        for pt in reversed(hist[:-1]):
+            dt_sec = latest_ts - _safe_float(pt.get("ts"))
+            if dt_sec >= 120:
+                ref_min_pt = pt
+                break
+
+        dt_min = (latest_ts - _safe_float(ref_min_pt.get("ts"))) / 60.0
+        dv_min = latest_views - _safe_int(ref_min_pt.get("views"))
+        if dt_min >= 1.0 and dv_min > 0:
+            delta_vpm = dv_min / dt_min
+
+        # Ponto de referência para taxa por hora (busca ponto próximo de 60 min atrás)
+        ref_hour_pt = hist[0]
+        for pt in reversed(hist[:-1]):
+            dt_sec = latest_ts - _safe_float(pt.get("ts"))
+            if dt_sec >= 3300:  # ~55 min
+                ref_hour_pt = pt
+                break
+
+        dt_hour = (latest_ts - _safe_float(ref_hour_pt.get("ts"))) / 3600.0
+        dv_hour = latest_views - _safe_int(ref_hour_pt.get("views"))
+        if dt_hour >= (1.0 / 60.0) and dv_hour > 0:
+            delta_vph = dv_hour / dt_hour
+
+    # Prioriza a velocidade do delta recente quando houver crescimento entre coletas;
+    # caso contrário, usa a taxa consolidada dos posts da conta (para nunca zerar paradas entre coletas)
+    final_vpm = delta_vpm if delta_vpm > 0 else lifetime_vpm
+    final_vph = delta_vph if delta_vph > 0 else (final_vpm * 60.0 if final_vpm > 0 else lifetime_vph)
+
+    # Se já havia um cálculo salvo válido e a conta caiu sem posts_list nem histórico, preserva o salvo
+    if final_vpm <= 0 and _safe_float(acc_dict.get("views_per_min")) > 0:
+        final_vpm = _safe_float(acc_dict.get("views_per_min"))
+    if final_vph <= 0 and _safe_float(acc_dict.get("views_per_hour")) > 0:
+        final_vph = _safe_float(acc_dict.get("views_per_hour"))
+
+    return round(final_vpm, 2), round(final_vph, 2)
 
 
 # ==============================================================================
@@ -264,22 +482,11 @@ def sort_accounts_by_views_desc(accounts_dict):
     return dict(sorted_items)
 
 
-def _safe_int(val):
-    try:
-        if val is None or val == "":
-            return 0
-        if isinstance(val, str):
-            val = val.replace(".", "").replace(",", "").strip()
-        return max(0, int(float(val)))
-    except Exception:
-        return 0
-
-
 def merge_best_account_data(base_acc, new_acc):
     """
     Combina duas versões dos dados de uma mesma conta garantindo que NUNCA
-    se percam seguidores, visualizações ou lista de posts caso uma fonte esteja zerada.
-    Usa sempre max() entre o histórico salvo e a leitura nova.
+    se percam seguidores, visualizações, histórico de velocidade ou lista de posts
+    caso uma fonte esteja zerada. Usa sempre max() entre o histórico salvo e a leitura nova.
     """
     if not isinstance(base_acc, dict):
         base_acc = {}
@@ -356,6 +563,18 @@ def merge_best_account_data(base_acc, new_acc):
     new_user = str(new_acc.get("username") or "").strip()
     if (not new_user or new_user.startswith("user_")) and old_user and not old_user.startswith("user_"):
         merged["username"] = old_user
+
+    # Mescla o histórico de pontos de visualizações e recalcula Views/Min e Views/Hora
+    snap_ts = _parse_br_datetime_to_ts(merged.get("metrics_updated_at"))
+    merged["views_history"] = _merge_views_history(
+        base_acc.get("views_history"),
+        new_acc.get("views_history"),
+        current_views=merged["total_views"],
+        current_ts=snap_ts
+    )
+    v_min, v_hour = _compute_account_velocity_rates(merged)
+    merged["views_per_min"] = v_min
+    merged["views_per_hour"] = v_hour
 
     return merged
 
@@ -696,10 +915,11 @@ def _classify_instagram_account_status(profile_ok, profile_err_obj, pub_limit_re
 def fetch_account_current_metrics(acc_config, last_json_entry):
     """
     Busca os números atuais na Meta e NUNCA apaga nem reduz para zero os seguidores,
-    visualizações totais ou lista de posts que já estavam salvos anteriormente.
+    visualizações totais, histórico de velocidade ou lista de posts que já estavam salvos.
     """
     ig_user_id = str(acc_config.get("ig_user_id", "")).strip()
     access_token = acc_config.get("access_token", "")
+    now_ts = time.time()
     now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
 
     previous_best = merge_best_account_data(acc_config, last_json_entry)
@@ -724,6 +944,9 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         current["media_count"] = prev_media_count
         current["posts_list"] = prev_posts_list
         current["metrics_updated_at"] = prev_updated_at
+        v_min, v_hour = _compute_account_velocity_rates(current)
+        current["views_per_min"] = v_min
+        current["views_per_hour"] = v_hour
         current.pop("access_token", None)
         return current
 
@@ -787,6 +1010,9 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         current["media_count"] = prev_media_count
         current["posts_list"] = sorted(prev_posts_list, key=lambda x: _safe_int(x.get("views")), reverse=True)
         current["metrics_updated_at"] = prev_updated_at
+        v_min, v_hour = _compute_account_velocity_rates(current)
+        current["views_per_min"] = v_min
+        current["views_per_hour"] = v_hour
         current.pop("access_token", None)
         return current
 
@@ -918,15 +1144,24 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
 
     posts_ranked.sort(key=lambda x: _safe_int(x.get("views")), reverse=True)
 
+    best_total_views = max(total_views, prev_views)
+    updated_history = _merge_views_history(
+        previous_best.get("views_history"),
+        [],
+        current_views=best_total_views,
+        current_ts=now_ts
+    )
+
     current = merge_best_account_data(
         previous_best,
         {
             **current,
             "posts_list": posts_ranked if len(posts_ranked) > 0 else prev_posts_list,
             "followers_count": max(fetched_followers or 0, prev_followers),
-            "total_views": max(total_views, prev_views),
+            "total_views": best_total_views,
             "media_count": max(fetched_media_count or 0, len(posts_ranked), prev_media_count),
-            "metrics_updated_at": now_str if not media_fetch_error else prev_updated_at
+            "metrics_updated_at": now_str if not media_fetch_error else prev_updated_at,
+            "views_history": updated_history
         }
     )
 
@@ -1016,7 +1251,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (CONTAS ORDENADAS POR VIEWS + MENU SUSPENSO + STATUS UPSTASH)
+# TEMPLATE HTML (CONTAS ORDENADAS POR VIEWS + VIEWS/MIN E VIEWS/HORA + TOTAIS)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -1040,7 +1275,7 @@ HTML_TEMPLATE = r"""
         }
         * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
-        .container { max-width: 1180px; margin: 0 auto; display: grid; gap: 20px; }
+        .container { max-width: 1280px; margin: 0 auto; display: grid; gap: 20px; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
         h1, h2 { margin: 0; }
         .hint { font-size: 0.82rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
@@ -1122,7 +1357,7 @@ HTML_TEMPLATE = r"""
         <div>
             <h1>Painel de Monitoramento 24h (Ordenado por Visualizações)</h1>
             <div class="hint">
-                🔒 <b>Proteção Anti-Zeramento Ativa:</b> Se uma conta cair ou bloquear a API, os últimos seguidores, visualizações e lista de posts ficam salvos no <b>Upstash Redis</b> e nunca são zerados.
+                🔒 <b>Proteção Anti-Zeramento Ativa:</b> Se uma conta cair ou bloquear a API, os últimos seguidores, visualizações, taxas por minuto/hora e lista de posts ficam salvos no <b>Upstash Redis</b> e nunca são zerados.
             </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
@@ -1153,9 +1388,11 @@ HTML_TEMPLATE = r"""
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
             <div>
                 <h2>3. Contas Conectadas ({{ accounts|length }}) — Mais Visualizações no Topo ↓</h2>
-                <div style="display:flex; gap:14px; font-size:0.88rem; color:var(--muted); margin-top:4px;">
+                <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:0.88rem; color:var(--muted); margin-top:6px;">
                     <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
                     <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
+                    <span>Views / Min Totais: <b style="color:#fbbf24;">{{ total_views_per_min | fmt_rate }}/min</b></span>
+                    <span>Views / Hora Totais: <b style="color:#c084fc;">{{ total_views_per_hour | fmt_rate }}/h</b></span>
                 </div>
             </div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -1178,6 +1415,8 @@ HTML_TEMPLATE = r"""
                         <th>Status da Conta (Instagram)</th>
                         <th>Seguidores</th>
                         <th>Visualizações Totais (Posts) ↓</th>
+                        <th>Views / Min</th>
+                        <th>Views / Hora</th>
                         <th>IG User ID</th>
                         <th>Etiqueta</th>
                         <th>Última Coleta Válida</th>
@@ -1211,13 +1450,19 @@ HTML_TEMPLATE = r"""
                             <span style="color:var(--muted); font-size:0.78rem; display:block;">({{ acc.get('media_count') }} post(s))</span>
                             {% endif %}
                         </td>
+                        <td>
+                            <span class="metric-val" style="color:#fbbf24;">{{ acc.get('views_per_min', 0) | fmt_rate }}/min</span>
+                        </td>
+                        <td>
+                            <span class="metric-val" style="color:#c084fc;">{{ acc.get('views_per_hour', 0) | fmt_rate }}/h</span>
+                        </td>
                         <td>{{ acc.ig_user_id }}</td>
                         <td>{{ acc.label }}</td>
                         <td>{{ acc.get('metrics_updated_at', '—') }}</td>
                         <td><span class="badge success">{{ acc.get('token_type_label', 'Longa Duração (60 dias)') }}</span></td>
                     </tr>
                     <tr id="posts_row_{{ acc_id }}" class="posts-dropdown-row" style="display:none;">
-                        <td colspan="9" style="padding:10px 16px;">
+                        <td colspan="11" style="padding:10px 16px;">
                             <div class="posts-dropdown-box">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
                                     <b style="color:#38bdf8; font-size:0.88rem;">
@@ -1351,8 +1596,17 @@ def index():
     accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
     last_sync_str = state.get("last_global_sync_str", "—")
 
+    # Garante que todas as contas tenham views_per_min e views_per_hour calculados
+    for acc in accounts.values():
+        if isinstance(acc, dict):
+            v_min, v_hour = _compute_account_velocity_rates(acc)
+            acc["views_per_min"] = v_min
+            acc["views_per_hour"] = v_hour
+
     total_followers = sum(_safe_int(acc.get("followers_count")) for acc in accounts.values())
     total_views = sum(_safe_int(acc.get("total_views")) for acc in accounts.values())
+    total_views_per_min = round(sum(_safe_float(acc.get("views_per_min")) for acc in accounts.values()), 2)
+    total_views_per_hour = round(sum(_safe_float(acc.get("views_per_hour")) for acc in accounts.values()), 2)
 
     return render_template_string(
         HTML_TEMPLATE,
@@ -1360,6 +1614,8 @@ def index():
         last_sync=last_sync_str,
         total_followers=total_followers,
         total_views=total_views,
+        total_views_per_min=total_views_per_min,
+        total_views_per_hour=total_views_per_hour,
         upstash_active=is_upstash_configured(),
         redis_bootstrapped=REDIS_BOOTSTRAPPED
     )
