@@ -427,7 +427,7 @@ def _group_posts_into_batches(posts_with_ts, max_gap_seconds=2700):
         return []
 
     # Ordena cronologicamente do mais antigo para o mais novo
-     chronological = sorted(posts_with_ts, key=lambda x: x["ts"])
+    chronological = sorted(posts_with_ts, key=lambda x: x["ts"])
     batches = []
     current_batch = [chronological[0]]
 
