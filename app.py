@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import hmac
 import json
 import time
@@ -18,6 +19,20 @@ app = Flask(__name__)
 # Fuso horário de Brasília (UTC-3)
 BRT = timezone(timedelta(hours=-3))
 GRAPH_API_VERSION = "v21.0"
+
+# ==============================================================================
+# PARÂMETROS DE SEGURANÇA OPERACIONAL (ANTI-CHECKPOINT & ANTI-CANIBALIZAÇÃO)
+# ==============================================================================
+# Intervalo mínimo após o 1º lote do dia (3h30 = 210 min, igual à operação manual de 3-4h)
+MIN_GAP_AFTER_BATCH1_MINS = 210
+# Intervalo de descanso longo após 2 lotes no dia (12h = 720 min, igual à operação manual de 12-24h)
+LONG_REST_AFTER_BATCH2_MINS = 720
+# Descanso de emergência quando um lote sofre queda brusca de alcance (<500 views/post)
+THROTTLE_PROTECTION_REST_MINS = 1080  # 18 horas
+# Limite seguro de posts em 24h por conta para não acionar filtro anti-spam da Meta
+SAFE_DAILY_POSTS_CAP = 20
+# Limite máximo de lotes em uma janela de 24h
+MAX_BATCHES_PER_24H = 2
 
 # ==============================================================================
 # CONFIGURAÇÃO UPSTASH REDIS (PERSISTÊNCIA DEFINITIVA NA VERCEL)
@@ -93,7 +108,7 @@ def format_rate_br(val):
 
 
 def format_duration_sec(val):
-    """Formata a duração do vídeo em segundos (ex: '14s' ou '1m12s (72s)')."""
+    """Formata a duração do vídeo em segundos (ex: '15s')."""
     try:
         sec = float(val or 0)
         if sec <= 0:
@@ -135,6 +150,20 @@ def _safe_float(val):
         return 0.0
 
 
+def _extract_quota_from_detail(acc_dict):
+    """Extrai o uso da cota de 24h (ex: 33 de 'Cota 24h: 33/100 usados') caso não esteja salvo em campo próprio."""
+    if not isinstance(acc_dict, dict):
+        return 0
+    q_direct = _safe_int(acc_dict.get("quota_usage_24h"))
+    if q_direct > 0:
+        return q_direct
+    detail = str(acc_dict.get("account_status_detail") or "")
+    m = re.search(r"Cota 24h:\s*(\d+)\s*/\s*(\d+)", detail)
+    if m:
+        return _safe_int(m.group(1))
+    return 0
+
+
 def _parse_mp4_mvhd_duration(data_bytes):
     """
     Procura a assinatura do átomo 'mvhd' nos bytes iniciais/finais de um arquivo MP4
@@ -165,12 +194,7 @@ def _parse_mp4_mvhd_duration(data_bytes):
 
 def _probe_video_duration_seconds(media_item):
     """
-    Obtém a duração em segundos de um Reel/Vídeo sem precisar baixar o vídeo inteiro:
-    1) Verifica se já está em cache por ID.
-    2) Verifica se o objeto já traz `video_duration` / `duration_sec`.
-    3) Faz uma requisição HTTP Range (primeiros 64 KB) na `media_url` do vídeo da CDN do Instagram
-       para ler o cabeçalho binário `mvhd` do MP4. Se o `moov` estiver no final do arquivo,
-       lê os últimos 64 KB.
+    Obtém a duração em segundos de um Reel/Vídeo sem precisar baixar o vídeo inteiro.
     """
     if not isinstance(media_item, dict):
         return 0.0
@@ -195,7 +219,6 @@ def _probe_video_duration_seconds(media_item):
         return 0.0
 
     try:
-        # Tenta os primeiros 64 KB (onde fica o átomo moov/mvhd em 99% dos vídeos de streaming da Meta)
         r = requests.get(
             media_url,
             headers={"Range": "bytes=0-65535", "User-Agent": "Mozilla/5.0"},
@@ -210,7 +233,6 @@ def _probe_video_duration_seconds(media_item):
                 MEDIA_DURATION_CACHE[mid] = dur
             return dur
 
-        # Fallback: caso o átomo moov esteja no final do MP4, busca os últimos 65 KB
         content_range = r.headers.get("Content-Range", "")
         if "/" in content_range:
             total_size = _safe_int(content_range.split("/")[-1])
@@ -247,9 +269,7 @@ def _parse_br_datetime_to_ts(dt_str):
 
 def _parse_ig_post_timestamp_to_brt(ts_str):
     """
-    Corrige o timestamp dos posts do Instagram:
-    A Graph API retorna timestamps em UTC (ex: '2026-11-03T17:53:00+0000' ou '2026-11-03 17:53').
-    Converte com precisão para o fuso de Brasília (BRT / UTC-3).
+    Converte o timestamp dos posts do Instagram (UTC) para o fuso de Brasília (BRT / UTC-3).
     """
     if not ts_str or not isinstance(ts_str, str):
         return None, "—"
@@ -394,10 +414,58 @@ def _compute_account_velocity_rates(acc_dict):
 
 
 # ==============================================================================
-# MOTOR DE INTELIGÊNCIA OPERACIONAL E ALOCAÇÃO DE TRAÇÃO
+# DETECTOR DE LOTES (CLUSTERS DE POSTAGEM) E MOTOR DE INTELIGÊNCIA ANTI-QUEDA
 # ==============================================================================
 
+def _group_posts_into_batches(posts_with_ts, max_gap_seconds=2700):
+    """
+    Agrupa os vídeos da conta em 'Lotes' reais (qualquer sequência de vídeos onde o intervalo
+    entre um vídeo e o seguinte foi <= 45 minutos pertence ao mesmo lote).
+    Retorna a lista de lotes ordenada do mais recente para o mais antigo.
+    """
+    if not posts_with_ts:
+        return []
+
+    # Ordena cronologicamente do mais antigo para o mais novo
+     chronological = sorted(posts_with_ts, key=lambda x: x["ts"])
+    batches = []
+    current_batch = [chronological[0]]
+
+    for item in chronological[1:]:
+        prev_ts = current_batch[-1]["ts"]
+        if (item["ts"] - prev_ts) <= max_gap_seconds:
+            current_batch.append(item)
+        else:
+            batches.append(current_batch)
+            current_batch = [item]
+    if current_batch:
+        batches.append(current_batch)
+
+    summary_batches = []
+    for b in reversed(batches):  # Mais recente primeiro
+        b_views = sum(x["views"] for x in b)
+        b_gain = sum(x["gain"] for x in b)
+        b_count = len(b)
+        summary_batches.append({
+            "start_ts": b[0]["ts"],
+            "end_ts": b[-1]["ts"],
+            "count": b_count,
+            "total_views": b_views,
+            "avg_views": int(round(b_views / max(1, b_count))),
+            "max_views": max(x["views"] for x in b),
+            "recent_gain": b_gain
+        })
+    return summary_batches
+
+
 def _analyze_account_intelligence(acc_dict):
+    """
+    Motor de Decisão Operacional v2 (Anti-Checkpoint + Anti-Canibalização):
+    - Separa a velocidade de vídeos antigos (de dias atrás) da performance real do último lote.
+    - Aplica a regra vencedora: até 2 lotes no dia (espaçados por 3h30–4h) seguidos de descanso de 12h–24h.
+    - Detecta throttling/shadowban quando um lote recente despenca de alcance, pausando a conta
+      antes que o Instagram aplique Checkpoint.
+    """
     if not isinstance(acc_dict, dict):
         return {}
 
@@ -411,6 +479,7 @@ def _analyze_account_intelligence(acc_dict):
     total_views = _safe_int(acc_dict.get("total_views"))
     followers = _safe_int(acc_dict.get("followers_count"))
     media_count = _safe_int(acc_dict.get("media_count"))
+    quota_24h = _extract_quota_from_detail(acc_dict)
 
     activity_index_pct = 0.0
     if peak_hour > 0:
@@ -436,16 +505,20 @@ def _analyze_account_intelligence(acc_dict):
     newest_post_ts = None
     recent_batch_count_3h = 0
     recent_batch_views_3h = 0
+    posts_last_24h_count = 0
+    posts_last_12h_count = 0
     hits_10k = 0
     virals_100k = 0
     dead_posts_count = 0
     top_post_views = 0
     winning_hours_counter = Counter()
+    posts_with_ts_for_clustering = []
 
     for p in posts:
         if not isinstance(p, dict):
             continue
         p_views = _safe_int(p.get("views"))
+        gain_recent = _safe_int(p.get("recent_views_gain"))
         top_post_views = max(top_post_views, p_views)
         if p_views >= 10000:
             hits_10k += 1
@@ -453,25 +526,34 @@ def _analyze_account_intelligence(acc_dict):
             virals_100k += 1
 
         raw_ts = p.get("timestamp_raw") or p.get("timestamp") or ""
-        p_ts, brt_str = _parse_ig_post_timestamp_to_ts_and_str(raw_ts)
+        p_ts, brt_str = _parse_ig_post_timestamp_to_brt(raw_ts)
         p["timestamp_brt"] = brt_str
 
         age_sec = max(60.0, now_ts - p_ts) if p_ts else None
         age_hours = (age_sec / 3600.0) if age_sec else None
         p["age_human"] = _format_age_human(age_sec) if age_sec else "—"
 
-        if p_ts and p_views >= 10000:
-            hr_brt = datetime.fromtimestamp(p_ts, tz=BRT).hour
-            winning_hours_counter[hr_brt] += (3 if p_views >= 100000 else 1)
-
         if p_ts:
+            posts_with_ts_for_clustering.append({
+                "id": p.get("id"),
+                "ts": p_ts,
+                "views": p_views,
+                "gain": gain_recent
+            })
+            if p_views >= 10000:
+                hr_brt = datetime.fromtimestamp(p_ts, tz=BRT).hour
+                winning_hours_counter[hr_brt] += (3 if p_views >= 100000 else 1)
+
             if newest_post_ts is None or p_ts > newest_post_ts:
                 newest_post_ts = p_ts
-            if age_sec <= 10800:
+            if age_sec <= 10800:  # 3h
                 recent_batch_count_3h += 1
                 recent_batch_views_3h += p_views
+            if age_sec <= 43200:  # 12h
+                posts_last_12h_count += 1
+            if age_sec <= 86400:  # 24h
+                posts_last_24h_count += 1
 
-        gain_recent = _safe_int(p.get("recent_views_gain"))
         if p_views >= 100000:
             p["diag_label"] = "🔥 Megaviral (+100k)"
             p["diag_badge"] = "success"
@@ -496,6 +578,28 @@ def _analyze_account_intelligence(acc_dict):
             p["diag_label"] = "😐 Alcance Baixo"
             p["diag_badge"] = "warning"
 
+    # Agrupamento de lotes reais da conta
+    batches = _group_posts_into_batches(posts_with_ts_for_clustering)
+    batches_24h = [b for b in batches if (now_ts - b["end_ts"]) <= 86400]
+    batches_12h = [b for b in batches if (now_ts - b["end_ts"]) <= 43200]
+    batches_24h_count = len(batches_24h)
+    batches_12h_count = len(batches_12h)
+
+    last_batch = batches[0] if batches else None
+    last_batch_count = last_batch["count"] if last_batch else 0
+    last_batch_views = last_batch["total_views"] if last_batch else 0
+    last_batch_avg_views = last_batch["avg_views"] if last_batch else 0
+    last_batch_gain = last_batch["recent_gain"] if last_batch else 0
+
+    # Média histórica dos lotes anteriores (excluindo o último lote) para detectar queda brusca
+    older_posts = [
+        x["views"] for x in posts_with_ts_for_clustering
+        if not last_batch or x["ts"] < last_batch["start_ts"]
+    ]
+    historical_avg_views = int(round(sum(older_posts) / len(older_posts))) if older_posts else 0
+
+    effective_posts_24h = max(posts_last_24h_count, quota_24h)
+
     total_listed_posts = len(posts)
     hit_rate_10k_pct = round((hits_10k / total_listed_posts) * 100.0, 1) if total_listed_posts > 0 else 0.0
     dead_rate_pct = round((dead_posts_count / total_listed_posts) * 100.0, 1) if total_listed_posts > 0 else 0.0
@@ -517,6 +621,14 @@ def _analyze_account_intelligence(acc_dict):
         mins_since_last_post = max(0, int((now_ts - newest_post_ts) // 60))
         last_post_age_str = f"há {_format_age_human(now_ts - newest_post_ts)}"
 
+    # Detecta se o último lote (já maturado > 2h) sofreu corte brusco de entrega (throttling)
+    last_batch_throttled = False
+    if last_batch and mins_since_last_post is not None and mins_since_last_post >= 120:
+        if last_batch_avg_views < 450:
+            last_batch_throttled = True
+        elif historical_avg_views >= 8000 and last_batch_avg_views < 1300 and last_batch_gain < 60:
+            last_batch_throttled = True
+
     action_code = "WAIT"
     action_badge = "info"
     action_title = "AGUARDAR"
@@ -525,20 +637,25 @@ def _analyze_account_intelligence(acc_dict):
     can_post_now = False
     recommended_batch_size = 0
 
+    # 1. CONTA CAÍDA / CHECKPOINT / SESSÃO EXPIRADA
     if status_badge == "error" or "Caiu" in status_text or "Desconectada" in status_text or "Bloqueada" in status_text:
         action_code = "RECONNECT"
         action_badge = "error"
         action_title = "🔌 RECONECTAR CONTA / TOKEN"
-        action_detail = "Sessão inválida ou checkpoint no Instagram. Faça login no aparelho antes de enviar lotes."
+        action_detail = "Sessão inválida ou checkpoint no Instagram. Faça login no aparelho e aguarde 12h antes de voltar a postar."
         priority_score = -100
         can_post_now = False
+
+    # 2. COTA DA API ATINGIDA
     elif status_text == "Limite Diário Atingido":
         action_code = "QUOTA_FULL"
         action_badge = "warning"
-        action_title = "🛑 COTA 24H ATINGIDA"
-        action_detail = "Limite da API oficial atingido. Aguarde a liberação da janela de 24h."
+        action_title = "🛑 COTA 24H DA META ATINGIDA"
+        action_detail = "Limite oficial atingido. Aguarde a liberação da janela de 24h."
         priority_score = -50
         can_post_now = False
+
+    # 3. CONTA ZUMBI CRÔNICA (NUNCA ENGATOU)
     elif total_listed_posts >= 15 and total_views < 15000 and v_min < 3.0:
         action_code = "PAUSE_ZOMBIE"
         action_badge = "error"
@@ -549,72 +666,121 @@ def _analyze_account_intelligence(acc_dict):
         )
         priority_score = 5
         can_post_now = False
-    elif mins_since_last_post is not None and mins_since_last_post < 120:
-        wait_left = max(15, 120 - mins_since_last_post)
-        if v_min >= 50 or recent_batch_views_3h >= 1500:
+
+    # 4. FREIO DE EMERGÊNCIA ANTI-CHECKPOINT (ÚLTIMO LOTE MORREU / THROTTLING DETECTADO)
+    elif last_batch_throttled and mins_since_last_post is not None and mins_since_last_post < THROTTLE_PROTECTION_REST_MINS:
+        wait_left_h = round((THROTTLE_PROTECTION_REST_MINS - mins_since_last_post) / 60.0, 1)
+        action_code = "THROTTLE_REST"
+        action_badge = "error"
+        action_title = f"🛡️ FREIO ANTI-QUEDA (DESCANSAR {wait_left_h}h)"
+        action_detail = (
+            f"O último lote ({last_batch_count} vídeos {last_post_age_str}) caiu para média de "
+            f"{format_number_br(last_batch_avg_views)} views/post. Forçar novo lote agora causa Checkpoint! "
+            f"Deixe a conta descansar pelo menos 18h."
+        )
+        priority_score = 10
+        can_post_now = False
+
+    # 5. TRAVA DE SEGURANÇA DIÁRIA: JÁ FEZ 2 LOTES OU >= 20 POSTS EM 24H -> DESCANSO LONGO (12H-24H)
+    elif (
+        (batches_24h_count >= MAX_BATCHES_PER_24H or effective_posts_24h >= SAFE_DAILY_POSTS_CAP)
+        and mins_since_last_post is not None
+        and mins_since_last_post < LONG_REST_AFTER_BATCH2_MINS
+    ):
+        wait_left_mins = max(30, LONG_REST_AFTER_BATCH2_MINS - mins_since_last_post)
+        wait_left_str = _format_age_human(wait_left_mins * 60)
+        action_code = "DAILY_CYCLE_REST"
+        action_badge = "warning"
+        action_title = f"🌙 DESCANSO DE CICLO 12H–24H (FALTAM {wait_left_str})"
+        action_detail = (
+            f"A conta já recebeu {batches_24h_count} lote(s) ({effective_posts_24h} vídeos) nas últimas 24h "
+            f"(último {last_post_age_str}). Para evitar Checkpoint e imitar seu padrão vencedor, "
+            f"aguarde {wait_left_str} antes do próximo lote!"
+        )
+        priority_score = 30
+        can_post_now = False
+
+    # 6. INTERVALO ENTRE 1º E 2º LOTE DO DIA (3H30 A 4H = 210 MINUTOS)
+    elif mins_since_last_post is not None and mins_since_last_post < MIN_GAP_AFTER_BATCH1_MINS:
+        wait_left = max(15, MIN_GAP_AFTER_BATCH1_MINS - mins_since_last_post)
+        wait_str = _format_age_human(wait_left * 60)
+        if v_min >= 50 or last_batch_views >= 2000:
             action_code = "COOLDOWN_HOT"
             action_badge = "warning"
-            action_title = f"⏳ NÃO CANIBALIZAR (AGUARDAR {wait_left}m)"
+            action_title = f"⏳ MATURANDO 1º LOTE (AGUARDAR {wait_str})"
             action_detail = (
-                f"Lote postado {last_post_age_str} já somou {format_number_br(recent_batch_views_3h)} views "
-                f"e a conta está a {format_rate_br(v_min)}/min. Deixe o lote atual maturar sozinho!"
+                f"Último lote ({last_batch_count} vídeos {last_post_age_str}) somou "
+                f"{format_number_br(last_batch_views)} views (média {format_number_br(last_batch_avg_views)}/post). "
+                f"Respeite a janela de 3h30–4h entre lotes!"
             )
-            priority_score = 65
+            priority_score = 60
         else:
             action_code = "COOLDOWN_MATURING"
             action_badge = "info"
-            action_title = f"⏳ MATURANDO LOTE ({wait_left}m RESTANTES)"
+            action_title = f"⏳ AGUARDAR JANELA 3H30 ({wait_str} RESTANTES)"
             action_detail = (
-                f"Último lote subiu {last_post_age_str} ({recent_batch_count_3h} vídeos). "
-                f"Espere completar 2h para avaliar se engatou antes de postar outro."
+                f"Lote enviado {last_post_age_str} ({last_batch_count} vídeos). "
+                f"Espere completar 3h30 para validar a entrega antes do 2º lote do dia."
             )
-            priority_score = 40
+            priority_score = 45
         can_post_now = False
-    elif v_min >= 80 or (v_hour >= 4500 and activity_index_pct >= 55):
+
+    # 7. CONTA LIVRE E DESCANSADA -> PRONTA PARA RECEBER LOTE AGORA!
+    elif v_min >= 60 or (v_hour >= 3500 and activity_index_pct >= 45) or (last_batch_avg_views >= 3000):
+        # Se não postou nada nas últimas 12h, é abertura de ciclo (lote maior: 9 vídeos)
+        # Se já postou 1 lote nas últimas 12h e esperou 3h30+, é o 2º lote do dia (6 a 8 vídeos)
+        if batches_12h_count == 0 and effective_posts_24h <= 12:
+            recommended_batch_size = 9
+            lote_tipo = "1º Lote do Ciclo (8–10 vídeos)"
+        else:
+            recommended_batch_size = 6
+            lote_tipo = "2º Lote do Dia (6 vídeos)"
+
         action_code = "SURF_TRACTION"
         action_badge = "success"
-        action_title = "🔥 SURFAR TRAÇÃO (POSTAR LOTE AGORA)"
+        action_title = f"🔥 ENVIAR {lote_tipo.upper()}"
         action_detail = (
-            f"Entrega aberta ({format_rate_br(v_min)}/min | {activity_index_pct:.0f}% do recorde) e último lote "
-            f"foi {last_post_age_str}. Suba lote de 5 a 8 vídeos validados agora para pegar carona!"
+            f"Janela segura liberada (último lote {last_post_age_str} com média de "
+            f"{format_number_br(last_batch_avg_views)} views/post | {batches_24h_count}/2 lotes em 24h). "
+            f"Conta a {format_rate_br(v_min)}/min!"
         )
         priority_score = 100 + int(min(50, v_min / 10))
         can_post_now = True
-        recommended_batch_size = 6
-    elif v_min >= 25 or (total_views >= 300000 and v_min >= 10):
-        if activity_index_pct < 25 and total_views >= 500000:
-            action_code = "REACTIVATE_CHAMPION"
-            action_badge = "warning"
-            action_title = "🎯 LOTE CURTO DE REATIVAÇÃO (3 VÍDEOS)"
-            action_detail = (
-                f"Conta gigante ({format_number_br(total_views)} views), mas operando a {activity_index_pct:.0f}% do pico "
-                f"(último post {last_post_age_str}). Suba apenas 3 criativos campeões de outras contas."
-            )
-            priority_score = 82
-            can_post_now = True
-            recommended_batch_size = 3
-        else:
+
+    elif v_min >= 15 or total_views >= 250000:
+        if batches_12h_count == 0 and effective_posts_24h == 0:
             action_code = "FEED_WARM"
             action_badge = "success"
-            action_title = "🚀 ALIMENTAR CONTA (LOTE 4–5 VÍDEOS)"
+            action_title = "🚀 ABRIR CICLO DIÁRIO (LOTE 8–9 VÍDEOS)"
             action_detail = (
-                f"Tração ativa ({format_rate_br(v_hour)}/h) e janela livre ({last_post_age_str}). "
-                f"Boa candidata para lote regular."
+                f"Conta descansada 12h+ ({last_post_age_str}) e saudável ({format_number_br(total_views)} views). "
+                f"Pronta para o 1º lote forte do dia."
             )
-            priority_score = 88
+            priority_score = 92
             can_post_now = True
-            recommended_batch_size = 5
+            recommended_batch_size = 9
+        else:
+            action_code = "REACTIVATE_CHAMPION"
+            action_badge = "success"
+            action_title = "🎯 2º LOTE MODERADO (6 VÍDEOS)"
+            action_detail = (
+                f"Intervalo de 3h30+ cumprido ({last_post_age_str}) e {batches_24h_count}/2 lotes em 24h. "
+                f"Envie 6 vídeos e depois dê 12h+ de descanso."
+            )
+            priority_score = 84
+            can_post_now = True
+            recommended_batch_size = 6
     else:
         action_code = "LOW_TRACTION"
         action_badge = "warning"
-        action_title = "🧪 TESTE ISOLADO (1–2 VÍDEOS)"
+        action_title = "🧪 TESTE DE AQUECIMENTO (3–4 VÍDEOS)"
         action_detail = (
-            f"Baixa velocidade atual ({format_rate_br(v_min)}/min). Não envie lotes grandes; "
-            f"teste 1 ou 2 vídeos no horário de pico ({best_window_str})."
+            f"Baixa velocidade atual ({format_rate_br(v_min)}/min). "
+            f"Envie lote curto no horário de pico ({best_window_str})."
         )
-        priority_score = 25
+        priority_score = 35
         can_post_now = True
-        recommended_batch_size = 2
+        recommended_batch_size = 4
 
     return {
         "activity_index_pct": activity_index_pct,
@@ -633,6 +799,14 @@ def _analyze_account_intelligence(acc_dict):
         "mins_since_last_post": mins_since_last_post,
         "recent_batch_count_3h": recent_batch_count_3h,
         "recent_batch_views_3h": recent_batch_views_3h,
+        "batches_24h_count": batches_24h_count,
+        "batches_12h_count": batches_12h_count,
+        "posts_last_24h_count": effective_posts_24h,
+        "last_batch_count": last_batch_count,
+        "last_batch_views": last_batch_views,
+        "last_batch_avg_views": last_batch_avg_views,
+        "historical_avg_views": historical_avg_views,
+        "last_batch_throttled": last_batch_throttled,
         "action_code": action_code,
         "action_badge": action_badge,
         "action_title": action_title,
@@ -951,6 +1125,9 @@ def merge_best_account_data(base_acc, new_acc):
     merged["peak_views_per_min"] = round(max(prev_peak_min, v_min), 2)
     merged["peak_views_per_hour"] = round(max(prev_peak_hour, v_hour), 2)
 
+    # Atualiza e persiste o diagnóstico de todos os posts e inteligência operacional
+    merged["intel"] = _analyze_account_intelligence(merged)
+
     return merged
 
 
@@ -1019,7 +1196,6 @@ def get_saved_state(force_redis=False):
         last_ts = MEMORY_LAST_SYNC_TS
         last_str = MEMORY_LAST_SYNC_STR
 
-        # Carrega primeiro deleted_ids de arquivos locais e do Upstash antes de mesclar contas
         for fpath in (BUNDLED_MONITOR_FILE, RUNTIME_ACCOUNTS_FILE):
             if os.path.exists(fpath):
                 fdata = load_json(fpath, {})
@@ -1044,11 +1220,9 @@ def get_saved_state(force_redis=False):
                     for d_id in redis_state.get("deleted_ids", []):
                         MEMORY_DELETED_IDS.add(str(d_id).strip())
 
-        # Remove da memória qualquer conta que esteja marcada como excluída
         for d_id in list(MEMORY_DELETED_IDS):
             MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
 
-        # 1. Dados vindos da configuração/ambiente
         env_accs = get_env_accounts()
         for uid, acc in env_accs.items():
             uid_s = str(uid).strip()
@@ -1058,7 +1232,6 @@ def get_saved_state(force_redis=False):
             clean_acc.pop("access_token", None)
             merged_accounts[uid_s] = merge_best_account_data(merged_accounts.get(uid_s, {}), clean_acc)
 
-        # 2. Dados do arquivo contas_monitoradas.json na raiz
         if os.path.exists(BUNDLED_MONITOR_FILE):
             bundled = load_json(BUNDLED_MONITOR_FILE, {})
             if isinstance(bundled, dict):
@@ -1076,7 +1249,6 @@ def get_saved_state(force_redis=False):
                     last_ts = float(bundled["last_global_sync_ts"])
                     last_str = bundled.get("last_global_sync_str", last_str)
 
-        # 3. Dados do arquivo runtime (/tmp ou local)
         if os.path.exists(RUNTIME_ACCOUNTS_FILE):
             runtime = load_json(RUNTIME_ACCOUNTS_FILE, {})
             if isinstance(runtime, dict):
@@ -1094,7 +1266,6 @@ def get_saved_state(force_redis=False):
                     last_ts = float(runtime["last_global_sync_ts"])
                     last_str = runtime.get("last_global_sync_str", last_str)
 
-        # 4. Dados persistentes do UPSTASH REDIS (já carregados acima se should_query_redis)
         if ok_redis and isinstance(redis_state, dict):
             redis_accs = redis_state.get("accounts", {})
             if isinstance(redis_accs, dict):
@@ -1112,7 +1283,6 @@ def get_saved_state(force_redis=False):
                 last_ts = float(redis_state["last_global_sync_ts"])
                 last_str = redis_state.get("last_global_sync_str", last_str)
 
-        # 5. Cache em memória RAM
         for uid, acc in list(MEMORY_CACHE_ACCOUNTS.items()):
             uid_s = str(uid).strip()
             if uid_s in MEMORY_DELETED_IDS:
@@ -1181,10 +1351,6 @@ def save_current_state(state_data):
 
 
 def delete_account_permanently(acc_id):
-    """
-    Remove uma conta do painel em memória, nos JSONs locais e no Upstash Redis,
-    registrando seu ID em `deleted_ids` para que não volte na sincronização.
-    """
     uid_s = str(acc_id or "").strip()
     if not uid_s:
         return False
@@ -1197,7 +1363,6 @@ def delete_account_permanently(acc_id):
         accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
         accounts.pop(uid_s, None)
 
-        # Se existir em contas_conectadas.json local e tivermos permissão de escrita, remove de lá também
         if os.path.exists(CODIGO1_ACCOUNTS_FILE) and os.access(BASE_DIR, os.W_OK):
             try:
                 c1_data = load_json(CODIGO1_ACCOUNTS_FILE, {})
@@ -1319,8 +1484,8 @@ def _classify_instagram_account_status(profile_ok, profile_err_obj, pub_limit_re
         msg = (err.get("message") or "").lower()
 
         if code == 190:
-            if subcode in (459, 464) or "checkpoint" in msg or "confirm your identity" in msg or "verify" in msg:
-                return ("Requer Verificação (Checkpoint)", "warning", err.get("message", "Conta solicitou confirmação/checkpoint no app."))
+            if subcode in (459, 464) or "checkpoint" in msg or "confirm your identity" in msg or "verify" in msg or "log in to www.instagram.com" in msg:
+                return ("Requer Verificação (Checkpoint)", "error", err.get("message", "Conta solicitou confirmação/checkpoint no app."))
             if subcode == 458 or "not authorized" in msg or "revoked" in msg:
                 return ("Desconectada (Acesso Revogado)", "error", err.get("message", "Permissão revogada no aplicativo."))
             if subcode in (463, 467):
@@ -1393,6 +1558,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         current["views_per_hour"] = v_hour
         current["peak_views_per_min"] = round(max(_safe_float(previous_best.get("peak_views_per_min")), v_min), 2)
         current["peak_views_per_hour"] = round(max(_safe_float(previous_best.get("peak_views_per_hour")), v_hour), 2)
+        current["intel"] = _analyze_account_intelligence(current)
         current.pop("access_token", None)
         return current
 
@@ -1440,6 +1606,10 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                 timeout=12
             )
             pub_limit_data = res_limit.json()
+            if isinstance(pub_limit_data, dict) and pub_limit_data.get("data"):
+                q_item = pub_limit_data["data"][0] if isinstance(pub_limit_data["data"], list) else {}
+                if isinstance(q_item.get("quota_usage"), int):
+                    current["quota_usage_24h"] = q_item["quota_usage"]
         except Exception:
             pub_limit_data = None
 
@@ -1461,6 +1631,7 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
         current["views_per_hour"] = v_hour
         current["peak_views_per_min"] = round(max(_safe_float(previous_best.get("peak_views_per_min")), v_min), 2)
         current["peak_views_per_hour"] = round(max(_safe_float(previous_best.get("peak_views_per_hour")), v_hour), 2)
+        current["intel"] = _analyze_account_intelligence(current)
         current.pop("access_token", None)
         return current
 
@@ -1469,7 +1640,6 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
     inline_ok = False
     media_fetch_error = False
 
-    # Solicita também media_url para permitir a inspeção rápida dos 64KB iniciais do MP4 e extrair a duração
     try:
         next_url = media_url
         params = {
@@ -1568,7 +1738,6 @@ def fetch_account_current_metrics(acc_config, last_json_entry):
                     media_views_map[mid] = fallback_v
                     total_views += fallback_v
 
-    # Descobre a duração em segundos (em paralelo) para vídeos que ainda não têm duration_sec salvo
     media_durations_map = {}
     items_needing_duration = []
     for m_item in all_media:
@@ -1666,7 +1835,6 @@ def refresh_all_accounts_to_json():
         saved_accounts = saved_state.get("accounts", {}) if isinstance(saved_state, dict) else {}
         env_accounts = get_env_accounts()
 
-        # Garante que contas excluídas nunca voltem
         for d_id in list(MEMORY_DELETED_IDS):
             saved_accounts.pop(d_id, None)
             env_accounts.pop(d_id, None)
@@ -1746,7 +1914,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (COM EXCLUSÃO DE CONTA + POPUP MODAL + DURAÇÃO DO VÍDEO EM SEGUNDOS)
+# TEMPLATE HTML (COM CADÊNCIA SEGURA 3H30 + DESCANSO 12H-24H + FREIO ANTI-QUEDA)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -1755,7 +1923,7 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Monitor 24h & Inteligência de Tração — Contas Conectadas</title>
+    <title>Monitor 24h & Inteligência Anti-Queda — Contas Conectadas</title>
     <style>
         :root {
             --bg: #0f172a;
@@ -1770,7 +1938,7 @@ HTML_TEMPLATE = r"""
         }
         * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
-        .container { max-width: 1650px; margin: 0 auto; display: grid; gap: 18px; }
+        .container { max-width: 1680px; margin: 0 auto; display: grid; gap: 18px; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
         h1, h2, h3 { margin: 0; }
         .hint { font-size: 0.82rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
@@ -1934,7 +2102,6 @@ HTML_TEMPLATE = r"""
             display: block;
             margin-top: 2px;
         }
-        /* MODAL POP-UP DE CONFIRMAÇÃO DE EXCLUSÃO */
         .modal-overlay {
             position: fixed;
             inset: 0;
@@ -2003,9 +2170,9 @@ HTML_TEMPLATE = r"""
 <div class="container">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
         <div>
-            <h1>Painel de Monitoramento 24h & Inteligência de Tração</h1>
+            <h1>Painel de Monitoramento 24h & Inteligência Anti-Queda (v2)</h1>
             <div class="hint">
-                🔒 <b>Proteção Anti-Zeramento + Alocação Inteligente:</b> O sistema cruza a aceleração em tempo real (<code>Views/Min</code> vs <code>Recorde</code>) com o tempo de maturação do último lote (corrigido para BRT) para indicar <b>onde postar agora</b> e <b>onde aguardar para não canibalizar</b>.
+                🛡️ <b>Cadência Blindada (Padrão Vencedor):</b> Máximo de <b>2 lotes/24h</b> com intervalo de <b>3h30–4h</b> entre o 1º e o 2º lote, seguido de <b>descanso obrigatório de 12h–24h</b> e freio automático se a média de views do último lote cair.
             </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
@@ -2031,13 +2198,13 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
-    <!-- CENTRAL DE COMANDO E ALOCAÇÃO DE LOTES (MOTOR INTELIGENTE) -->
+    <!-- CENTRAL DE COMANDO E ALOCAÇÃO DE LOTES (MOTOR INTELIGENTE V2) -->
     <div class="card" style="border-color:#3b82f6;">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
             <div>
-                <h2 style="color:#60a5fa;">🧠 Central Tática de Alocação de Lotes (Anti-Canibalização & Tração)</h2>
+                <h2 style="color:#60a5fa;">🧠 Central Tática de Alocação de Lotes (3h30 entre Lotes + Descanso 12h–24h)</h2>
                 <div class="hint">
-                    Decisão automatizada cruzando <b>Velocidade Atual</b>, <b>Índice de Atividade (Recorde)</b> e <b>Janela de Maturação de 120 min</b> do último lote.
+                    Evita o erro de postar de 2h em 2h quando vídeos antigos estão viralizando: avalia a <b>média real do último lote</b>, <b>quantidade de lotes em 24h</b> e <b>tempo de descanso</b>.
                 </div>
             </div>
             <span class="badge info">API Automação: <code>/api/smart_queue</code></span>
@@ -2046,13 +2213,13 @@ HTML_TEMPLATE = r"""
         <div class="intel-grid">
             <!-- COLUNA 1: CONTAS PRONTAS PARA RECEBER LOTE AGORA -->
             <div class="intel-box" style="border-color:rgba(34,197,94,0.4);">
-                <h3 style="color:#4ade80;">🔥 Prontas p/ Lote Agora (Surfar Tração / Reativar)</h3>
+                <h3 style="color:#4ade80;">🔥 Prontas p/ Lote Agora (Janela 3h30+ ou 12h+ Cumprida)</h3>
                 {% if ready_to_post_list %}
                     {% for item in ready_to_post_list %}
                     <div class="intel-item">
                         <div>
                             <b>@{{ item.username }}</b>
-                            <span class="sub-meta">{{ item.intel.action_title }} • Último post {{ item.intel.last_post_age_str }}</span>
+                            <span class="sub-meta">{{ item.intel.action_title }} • Último {{ item.intel.last_post_age_str }} ({{ item.intel.batches_24h_count }}/2 lotes 24h)</span>
                         </div>
                         <div style="text-align:right;">
                             <span class="badge success">{{ item.views_per_min | fmt_rate }}/min</span>
@@ -2061,36 +2228,36 @@ HTML_TEMPLATE = r"""
                     </div>
                     {% endfor %}
                 {% else %}
-                    <div class="hint">Nenhuma conta livre com alta tração neste minuto (verifique as contas em maturação ao lado).</div>
+                    <div class="hint">Nenhuma conta livre para lote neste momento (todas cumprindo janela de 3h30 ou descanso de 12h–24h).</div>
                 {% endif %}
             </div>
 
-            <!-- COLUNA 2: CONTAS EM COOLDOWN ANTI-CANIBALIZAÇÃO -->
+            <!-- COLUNA 2: CONTAS EM MATURAÇÃO (3H30) OU DESCANSO DE CICLO (12H-24H) -->
             <div class="intel-box" style="border-color:rgba(245,158,11,0.4);">
-                <h3 style="color:#fbbf24;">⏳ Em Maturação de Lote (Não Postar Por Cima!)</h3>
+                <h3 style="color:#fbbf24;">⏳ Em Maturação (3h30) ou Descanso de Ciclo (12h–24h)</h3>
                 {% if maturing_cooldown_list %}
                     {% for item in maturing_cooldown_list %}
                     <div class="intel-item">
                         <div>
                             <b>@{{ item.username }}</b>
                             <span class="sub-meta">
-                                Lote {{ item.intel.last_post_age_str }} ({{ item.intel.recent_batch_count_3h }} vídeos = +{{ item.intel.recent_batch_views_3h | fmt_num }} views)
+                                {{ item.intel.action_title }} • Lote {{ item.intel.last_post_age_str }} (média {{ item.intel.last_batch_avg_views | fmt_num }} views/post)
                             </span>
                         </div>
                         <div style="text-align:right;">
-                            <span class="badge warning">{{ item.views_per_min | fmt_rate }}/min</span>
-                            <span class="sub-meta" style="color:#fbbf24;">Aguardar {{ 120 - (item.intel.mins_since_last_post or 0) }} min</span>
+                            <span class="badge warning">{{ item.intel.batches_24h_count }}/2 lotes (24h)</span>
+                            <span class="sub-meta" style="color:#fbbf24;">{{ item.intel.posts_last_24h_count }} vídeos em 24h</span>
                         </div>
                     </div>
                     {% endfor %}
                 {% else %}
-                    <div class="hint">Nenhuma conta com lote recém-postado nos últimos 120 minutos.</div>
+                    <div class="hint">Nenhuma conta em janela de espera ou descanso de ciclo.</div>
                 {% endif %}
             </div>
 
-            <!-- COLUNA 3: CONTAS ZUMBIS / PAUSAR OU RECONECTAR -->
+            <!-- COLUNA 3: FREIO ANTI-QUEDA / ZUMBIS / RECONECTAR -->
             <div class="intel-box" style="border-color:rgba(239,68,68,0.4);">
-                <h3 style="color:#f87171;">🛑 Pausar Criativos (Zumbis) ou Reconectar</h3>
+                <h3 style="color:#f87171;">🛑 Freio Anti-Queda, Zumbis ou Reconectar</h3>
                 {% if paused_or_down_list %}
                     {% for item in paused_or_down_list %}
                     <div class="intel-item">
@@ -2100,12 +2267,12 @@ HTML_TEMPLATE = r"""
                         </div>
                         <div style="text-align:right;">
                             <span class="badge {{ item.intel.action_badge }}">{{ item.total_views | fmt_num }} views</span>
-                            <span class="sub-meta">{{ item.media_count }} posts</span>
+                            <span class="sub-meta">Último lote: {{ item.intel.last_batch_avg_views | fmt_num }}/post</span>
                         </div>
                     </div>
                     {% endfor %}
                 {% else %}
-                    <div class="hint">Todas as contas estão saudáveis e entregando normalmente.</div>
+                    <div class="hint">Todas as contas estão saudáveis e sem sinais de throttling.</div>
                 {% endif %}
             </div>
         </div>
@@ -2148,15 +2315,15 @@ HTML_TEMPLATE = r"""
                     <tr>
                         <th style="width:78px; text-align:center;">Rank / Posts</th>
                         <th>@Username</th>
-                        <th>Status API</th>
+                        <th>Status API & Cota 24h</th>
                         <th>Seguidores & Conv.</th>
                         <th>Visualizações Totais ↓</th>
                         <th>Views / Min (Atual)</th>
                         <th>Views / Hora (Atual)</th>
                         <th>🏆 Recordes (Min / Hora)</th>
                         <th style="min-width:135px;">Índice Atividade & Ritmo</th>
-                        <th>Último Lote & Janela Pico</th>
-                        <th style="min-width:230px;">🧠 Recomendação Operacional</th>
+                        <th>Último Lote & Fadiga 24h</th>
+                        <th style="min-width:250px;">🧠 Recomendação Anti-Queda</th>
                         <th>Última Coleta</th>
                         <th style="width:52px; text-align:center;">Excluir</th>
                     </tr>
@@ -2225,11 +2392,12 @@ HTML_TEMPLATE = r"""
                         </td>
                         <td>
                             <b style="color:#e2e8f0; font-size:0.81rem;">Último: {{ intel.get('last_post_age_str', '—') }}</b>
-                            {% if intel.get('recent_batch_count_3h', 0) > 0 %}
-                            <span class="sub-meta" style="color:#4ade80;">
-                                Lote 3h: {{ intel.get('recent_batch_count_3h') }} posts (+{{ intel.get('recent_batch_views_3h') | fmt_num }} v)
+                            <span class="sub-meta" style="color:{% if intel.get('batches_24h_count', 0) >= 2 %}#fbbf24{% else %}#4ade80{% endif %}; font-weight:600;">
+                                📦 24h: {{ intel.get('batches_24h_count', 0) }}/2 lotes ({{ intel.get('posts_last_24h_count', 0) }} vídeos)
                             </span>
-                            {% endif %}
+                            <span class="sub-meta" style="color:#cbd5e1;">
+                                Média últ. lote: <b>{{ intel.get('last_batch_avg_views', 0) | fmt_num }}</b> views/post
+                            </span>
                             <span class="sub-meta" style="color:#38bdf8;">
                                 ⏰ {{ intel.get('best_window_str', '—') }}
                             </span>
@@ -2238,7 +2406,7 @@ HTML_TEMPLATE = r"""
                             <span class="badge {{ intel.get('action_badge', 'info') }}">
                                 {{ intel.get('action_title', '—') }}
                             </span>
-                            <span class="sub-meta" style="max-width:265px; white-space:normal; line-height:1.3;">
+                            <span class="sub-meta" style="max-width:275px; white-space:normal; line-height:1.3;">
                                 {{ intel.get('action_detail', '') }}
                             </span>
                         </td>
@@ -2441,7 +2609,6 @@ HTML_TEMPLATE = r"""
 
     let remaining = 60;
     setInterval(() => {
-        // Pausa o reload automático se o modal de confirmação estiver aberto
         const modal = document.getElementById('deleteModalOverlay');
         if (modal && modal.style.display === 'flex') return;
 
@@ -2501,9 +2668,9 @@ def index():
             acode = intel.get("action_code", "")
             if acode in ("SURF_TRACTION", "FEED_WARM", "REACTIVATE_CHAMPION"):
                 ready_to_post_list.append(acc)
-            elif acode in ("COOLDOWN_HOT", "COOLDOWN_MATURING"):
+            elif acode in ("COOLDOWN_HOT", "COOLDOWN_MATURING", "DAILY_CYCLE_REST"):
                 maturing_cooldown_list.append(acc)
-            elif acode in ("PAUSE_ZOMBIE", "RECONNECT", "QUOTA_FULL"):
+            elif acode in ("PAUSE_ZOMBIE", "THROTTLE_REST", "RECONNECT", "QUOTA_FULL"):
                 paused_or_down_list.append(acc)
 
             uname = str(acc.get("username") or "").strip()
@@ -2577,6 +2744,9 @@ def api_smart_queue():
             "views_per_hour": v_hour,
             "activity_index_pct": intel.get("activity_index_pct"),
             "mins_since_last_post": intel.get("mins_since_last_post"),
+            "batches_24h_count": intel.get("batches_24h_count", 0),
+            "posts_last_24h_count": intel.get("posts_last_24h_count", 0),
+            "last_batch_avg_views": intel.get("last_batch_avg_views", 0),
             "best_window_brt": intel.get("best_window_str")
         })
 
