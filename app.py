@@ -61,6 +61,7 @@ SYNC_LOCK = threading.Lock()
 
 # Cache em memória do processo
 MEMORY_CACHE_ACCOUNTS = {}
+MEMORY_CUSTOM_TOKENS = {}  # uid_str -> access_token (contas adicionadas via painel web)
 MEMORY_DELETED_IDS = set()
 MEMORY_LAST_SYNC_TS = 0.0
 MEMORY_LAST_SYNC_STR = "Ainda não sincronizado"
@@ -426,7 +427,6 @@ def _group_posts_into_batches(posts_with_ts, max_gap_seconds=2700):
     if not posts_with_ts:
         return []
 
-    # Ordena cronologicamente do mais antigo para o mais novo
     chronological = sorted(posts_with_ts, key=lambda x: x["ts"])
     batches = []
     current_batch = [chronological[0]]
@@ -442,7 +442,7 @@ def _group_posts_into_batches(posts_with_ts, max_gap_seconds=2700):
         batches.append(current_batch)
 
     summary_batches = []
-    for b in reversed(batches):  # Mais recente primeiro
+    for b in reversed(batches):
         b_views = sum(x["views"] for x in b)
         b_gain = sum(x["gain"] for x in b)
         b_count = len(b)
@@ -460,11 +460,7 @@ def _group_posts_into_batches(posts_with_ts, max_gap_seconds=2700):
 
 def _analyze_account_intelligence(acc_dict):
     """
-    Motor de Decisão Operacional v2 (Anti-Checkpoint + Anti-Canibalização):
-    - Separa a velocidade de vídeos antigos (de dias atrás) da performance real do último lote.
-    - Aplica a regra vencedora: até 2 lotes no dia (espaçados por 3h30–4h) seguidos de descanso de 12h–24h.
-    - Detecta throttling/shadowban quando um lote recente despenca de alcance, pausando a conta
-      antes que o Instagram aplique Checkpoint.
+    Motor de Decisão Operacional v2 (Anti-Checkpoint + Anti-Canibalização).
     """
     if not isinstance(acc_dict, dict):
         return {}
@@ -578,7 +574,6 @@ def _analyze_account_intelligence(acc_dict):
             p["diag_label"] = "😐 Alcance Baixo"
             p["diag_badge"] = "warning"
 
-    # Agrupamento de lotes reais da conta
     batches = _group_posts_into_batches(posts_with_ts_for_clustering)
     batches_24h = [b for b in batches if (now_ts - b["end_ts"]) <= 86400]
     batches_12h = [b for b in batches if (now_ts - b["end_ts"]) <= 43200]
@@ -591,7 +586,6 @@ def _analyze_account_intelligence(acc_dict):
     last_batch_avg_views = last_batch["avg_views"] if last_batch else 0
     last_batch_gain = last_batch["recent_gain"] if last_batch else 0
 
-    # Média histórica dos lotes anteriores (excluindo o último lote) para detectar queda brusca
     older_posts = [
         x["views"] for x in posts_with_ts_for_clustering
         if not last_batch or x["ts"] < last_batch["start_ts"]
@@ -621,7 +615,6 @@ def _analyze_account_intelligence(acc_dict):
         mins_since_last_post = max(0, int((now_ts - newest_post_ts) // 60))
         last_post_age_str = f"há {_format_age_human(now_ts - newest_post_ts)}"
 
-    # Detecta se o último lote (já maturado > 2h) sofreu corte brusco de entrega (throttling)
     last_batch_throttled = False
     if last_batch and mins_since_last_post is not None and mins_since_last_post >= 120:
         if last_batch_avg_views < 450:
@@ -637,7 +630,6 @@ def _analyze_account_intelligence(acc_dict):
     can_post_now = False
     recommended_batch_size = 0
 
-    # 1. CONTA CAÍDA / CHECKPOINT / SESSÃO EXPIRADA
     if status_badge == "error" or "Caiu" in status_text or "Desconectada" in status_text or "Bloqueada" in status_text:
         action_code = "RECONNECT"
         action_badge = "error"
@@ -646,7 +638,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = -100
         can_post_now = False
 
-    # 2. COTA DA API ATINGIDA
     elif status_text == "Limite Diário Atingido":
         action_code = "QUOTA_FULL"
         action_badge = "warning"
@@ -655,7 +646,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = -50
         can_post_now = False
 
-    # 3. CONTA ZUMBI CRÔNICA (NUNCA ENGATOU)
     elif total_listed_posts >= 15 and total_views < 15000 and v_min < 3.0:
         action_code = "PAUSE_ZOMBIE"
         action_badge = "error"
@@ -667,7 +657,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = 5
         can_post_now = False
 
-    # 4. FREIO DE EMERGÊNCIA ANTI-CHECKPOINT (ÚLTIMO LOTE MORREU / THROTTLING DETECTADO)
     elif last_batch_throttled and mins_since_last_post is not None and mins_since_last_post < THROTTLE_PROTECTION_REST_MINS:
         wait_left_h = round((THROTTLE_PROTECTION_REST_MINS - mins_since_last_post) / 60.0, 1)
         action_code = "THROTTLE_REST"
@@ -681,7 +670,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = 10
         can_post_now = False
 
-    # 5. TRAVA DE SEGURANÇA DIÁRIA: JÁ FEZ 2 LOTES OU >= 20 POSTS EM 24H -> DESCANSO LONGO (12H-24H)
     elif (
         (batches_24h_count >= MAX_BATCHES_PER_24H or effective_posts_24h >= SAFE_DAILY_POSTS_CAP)
         and mins_since_last_post is not None
@@ -700,7 +688,6 @@ def _analyze_account_intelligence(acc_dict):
         priority_score = 30
         can_post_now = False
 
-    # 6. INTERVALO ENTRE 1º E 2º LOTE DO DIA (3H30 A 4H = 210 MINUTOS)
     elif mins_since_last_post is not None and mins_since_last_post < MIN_GAP_AFTER_BATCH1_MINS:
         wait_left = max(15, MIN_GAP_AFTER_BATCH1_MINS - mins_since_last_post)
         wait_str = _format_age_human(wait_left * 60)
@@ -725,10 +712,7 @@ def _analyze_account_intelligence(acc_dict):
             priority_score = 45
         can_post_now = False
 
-    # 7. CONTA LIVRE E DESCANSADA -> PRONTA PARA RECEBER LOTE AGORA!
     elif v_min >= 60 or (v_hour >= 3500 and activity_index_pct >= 45) or (last_batch_avg_views >= 3000):
-        # Se não postou nada nas últimas 12h, é abertura de ciclo (lote maior: 9 vídeos)
-        # Se já postou 1 lote nas últimas 12h e esperou 3h30+, é o 2º lote do dia (6 a 8 vídeos)
         if batches_12h_count == 0 and effective_posts_24h <= 12:
             recommended_batch_size = 9
             lote_tipo = "1º Lote do Ciclo (8–10 vídeos)"
@@ -822,7 +806,7 @@ def _parse_ig_post_timestamp_to_ts_and_str(raw_ts):
 
 
 # ==============================================================================
-# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (COM RETRY E LISTA DE EXCLUÍDAS)
+# FUNÇÕES DE PERSISTÊNCIA NO UPSTASH REDIS (COM RETRY, TOKENS E LISTA DE EXCLUÍDAS)
 # ==============================================================================
 
 def is_upstash_configured():
@@ -888,9 +872,9 @@ def load_state_from_upstash():
 def save_state_to_upstash(state_data):
     """
     Salva o estado completo no Upstash Redis usando 1 comando (SET),
-    respeitando as contas removidas (`deleted_ids`).
+    respeitando as contas removidas (`deleted_ids`) e preservando `custom_tokens`.
     """
-    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS
+    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
     if not is_upstash_configured() or not isinstance(state_data, dict):
         return False
 
@@ -907,6 +891,13 @@ def save_state_to_upstash(state_data):
             if isinstance(remote_state, dict):
                 for d_id in remote_state.get("deleted_ids", []):
                     MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+                remote_tokens = remote_state.get("custom_tokens", {})
+                if isinstance(remote_tokens, dict):
+                    for t_uid, t_val in remote_tokens.items():
+                        uid_s = str(t_uid).strip()
+                        if uid_s and t_val and uid_s not in MEMORY_DELETED_IDS:
+                            MEMORY_CUSTOM_TOKENS[uid_s] = str(t_val).strip()
 
                 remote_accs = remote_state.get("accounts", {})
                 if isinstance(remote_accs, dict):
@@ -927,8 +918,15 @@ def save_state_to_upstash(state_data):
         for d_id in state_data.get("deleted_ids", []):
             MEMORY_DELETED_IDS.add(str(d_id).strip())
 
+        if isinstance(state_data.get("custom_tokens"), dict):
+            for t_uid, t_val in state_data["custom_tokens"].items():
+                uid_s = str(t_uid).strip()
+                if uid_s and t_val and uid_s not in MEMORY_DELETED_IDS:
+                    MEMORY_CUSTOM_TOKENS[uid_s] = str(t_val).strip()
+
         for d_id in list(MEMORY_DELETED_IDS):
             MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
+            MEMORY_CUSTOM_TOKENS.pop(d_id, None)
 
         new_accs = state_data.get("accounts", {}) if isinstance(state_data.get("accounts"), dict) else {}
         cleaned_accs = {}
@@ -954,6 +952,7 @@ def save_state_to_upstash(state_data):
                 else (MEMORY_LAST_SYNC_STR or "—")
             ),
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accs
         }
 
@@ -961,6 +960,7 @@ def save_state_to_upstash(state_data):
         if ok_set:
             state_data["accounts"] = sorted_accs
             state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
+            state_data["custom_tokens"] = dict(MEMORY_CUSTOM_TOKENS)
             LAST_REDIS_FETCH_TS = time.time()
             REDIS_BOOTSTRAPPED = True
             return True
@@ -1125,7 +1125,6 @@ def merge_best_account_data(base_acc, new_acc):
     merged["peak_views_per_min"] = round(max(prev_peak_min, v_min), 2)
     merged["peak_views_per_hour"] = round(max(prev_peak_hour, v_hour), 2)
 
-    # Atualiza e persiste o diagnóstico de todos os posts e inteligência operacional
     merged["intel"] = _analyze_account_intelligence(merged)
 
     return merged
@@ -1133,8 +1132,8 @@ def merge_best_account_data(base_acc, new_acc):
 
 def get_env_accounts():
     """
-    Lê as contas de ACCOUNTS_CONFIG_JSON e também mescla com quaisquer métricas
-    salvas em `contas_conectadas.json`, ignorando contas excluídas pelo usuário.
+    Lê as contas de ACCOUNTS_CONFIG_JSON, mescla com `contas_conectadas.json`
+    e também inclui contas/tokens adicionados diretamente pelo painel web (`MEMORY_CUSTOM_TOKENS`).
     """
     raw = os.environ.get("ACCOUNTS_CONFIG_JSON", "").strip()
     accounts_dict = {}
@@ -1185,11 +1184,25 @@ def get_env_accounts():
         except Exception as e:
             print(f"[ERRO] Falha ao ler contas_conectadas.json: {e}", flush=True)
 
+    # Inclui ou atualiza tokens adicionados pelo formulário web
+    for uid_str, tok in list(MEMORY_CUSTOM_TOKENS.items()):
+        if not uid_str or uid_str in MEMORY_DELETED_IDS:
+            continue
+        if uid_str in accounts_dict:
+            if tok:
+                accounts_dict[uid_str]["access_token"] = tok
+        else:
+            cached = dict(MEMORY_CACHE_ACCOUNTS.get(uid_str, {}))
+            cached["ig_user_id"] = uid_str
+            if tok:
+                cached["access_token"] = tok
+            accounts_dict[uid_str] = cached
+
     return accounts_dict
 
 
 def get_saved_state(force_redis=False):
-    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_DELETED_IDS
+    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
 
     with ACCOUNTS_LOCK:
         merged_accounts = {}
@@ -1202,6 +1215,11 @@ def get_saved_state(force_redis=False):
                 if isinstance(fdata, dict):
                     for d_id in fdata.get("deleted_ids", []):
                         MEMORY_DELETED_IDS.add(str(d_id).strip())
+                    if isinstance(fdata.get("custom_tokens"), dict):
+                        for t_uid, t_val in fdata["custom_tokens"].items():
+                            uid_s = str(t_uid).strip()
+                            if uid_s and t_val and uid_s not in MEMORY_DELETED_IDS:
+                                MEMORY_CUSTOM_TOKENS[uid_s] = str(t_val).strip()
 
         now = time.time()
         should_query_redis = (
@@ -1219,9 +1237,15 @@ def get_saved_state(force_redis=False):
                 if isinstance(redis_state, dict):
                     for d_id in redis_state.get("deleted_ids", []):
                         MEMORY_DELETED_IDS.add(str(d_id).strip())
+                    if isinstance(redis_state.get("custom_tokens"), dict):
+                        for t_uid, t_val in redis_state["custom_tokens"].items():
+                            uid_s = str(t_uid).strip()
+                            if uid_s and t_val and uid_s not in MEMORY_DELETED_IDS:
+                                MEMORY_CUSTOM_TOKENS[uid_s] = str(t_val).strip()
 
         for d_id in list(MEMORY_DELETED_IDS):
             MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
+            MEMORY_CUSTOM_TOKENS.pop(d_id, None)
 
         env_accs = get_env_accounts()
         for uid, acc in env_accs.items():
@@ -1302,6 +1326,7 @@ def get_saved_state(force_redis=False):
             "last_global_sync_ts": last_ts,
             "last_global_sync_str": last_str,
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accs
         }
 
@@ -1314,15 +1339,22 @@ def get_saved_state(force_redis=False):
 
 
 def save_current_state(state_data):
-    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS
+    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
 
     with ACCOUNTS_LOCK:
         if isinstance(state_data, dict):
             for d_id in state_data.get("deleted_ids", []):
                 MEMORY_DELETED_IDS.add(str(d_id).strip())
 
+            if isinstance(state_data.get("custom_tokens"), dict):
+                for t_uid, t_val in state_data["custom_tokens"].items():
+                    uid_s = str(t_uid).strip()
+                    if uid_s and t_val and uid_s not in MEMORY_DELETED_IDS:
+                        MEMORY_CUSTOM_TOKENS[uid_s] = str(t_val).strip()
+
             for d_id in list(MEMORY_DELETED_IDS):
                 MEMORY_CACHE_ACCOUNTS.pop(d_id, None)
+                MEMORY_CUSTOM_TOKENS.pop(d_id, None)
 
             if float(state_data.get("last_global_sync_ts") or 0) > MEMORY_LAST_SYNC_TS:
                 MEMORY_LAST_SYNC_TS = float(state_data["last_global_sync_ts"])
@@ -1334,12 +1366,15 @@ def save_current_state(state_data):
                     if uid_s in MEMORY_DELETED_IDS:
                         continue
                     clean_acc = dict(acc)
-                    clean_acc.pop("access_token", None)
+                    tok_inline = clean_acc.pop("access_token", None)
+                    if tok_inline:
+                        MEMORY_CUSTOM_TOKENS[uid_s] = str(tok_inline).strip()
                     MEMORY_CACHE_ACCOUNTS[uid_s] = merge_best_account_data(
                         MEMORY_CACHE_ACCOUNTS.get(uid_s, {}), clean_acc
                     )
                 state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
                 state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
+                state_data["custom_tokens"] = dict(MEMORY_CUSTOM_TOKENS)
 
         if is_upstash_configured():
             save_state_to_upstash(state_data)
@@ -1359,6 +1394,7 @@ def delete_account_permanently(acc_id):
         state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
         MEMORY_DELETED_IDS.add(uid_s)
         MEMORY_CACHE_ACCOUNTS.pop(uid_s, None)
+        MEMORY_CUSTOM_TOKENS.pop(uid_s, None)
 
         accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
         accounts.pop(uid_s, None)
@@ -1379,10 +1415,124 @@ def delete_account_permanently(acc_id):
             "last_global_sync_ts": state.get("last_global_sync_ts", MEMORY_LAST_SYNC_TS),
             "last_global_sync_str": state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR),
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sort_accounts_by_views_desc(accounts)
         }
         save_current_state(new_state)
         return True
+
+
+def add_or_update_account_minimal(ig_user_id_input, access_token_input):
+    """
+    Adiciona ou reconecta uma conta usando apenas 1 ou 2 dados:
+    - Somente o Access Token (descobre o IG User ID e @username automaticamente via /me)
+    - Ou Access Token + IG User ID
+    - Ou somente o IG User ID (caso o token já exista no ambiente/histórico ou para cadastro inicial)
+    """
+    uid_clean = str(ig_user_id_input or "").strip()
+    token_clean = str(access_token_input or "").strip()
+
+    if not uid_clean and not token_clean:
+        return False, "Informe pelo menos o Access Token ou o ID da conta.", None
+
+    discovered_username = None
+
+    # Se enviou Token, tenta descobrir/validar o ID e o @username automaticamente na API
+    if token_clean:
+        endpoints = []
+        if uid_clean:
+            endpoints.append(f"https://graph.instagram.com/{GRAPH_API_VERSION}/{uid_clean}")
+        endpoints.append(f"https://graph.instagram.com/{GRAPH_API_VERSION}/me")
+
+        last_err_msg = None
+        for ep in endpoints:
+            try:
+                r = requests.get(
+                    ep,
+                    params={
+                        "fields": "id,user_id,username,name,account_type,followers_count,media_count",
+                        "access_token": token_clean
+                    },
+                    timeout=15
+                )
+                p_data = r.json()
+                if r.status_code == 200 and isinstance(p_data, dict) and "error" not in p_data:
+                    resolved_id = str(p_data.get("user_id") or p_data.get("id") or "").strip()
+                    if not uid_clean and resolved_id:
+                        uid_clean = resolved_id
+                    if p_data.get("username"):
+                        discovered_username = str(p_data["username"]).strip()
+                    break
+                elif isinstance(p_data, dict) and "error" in p_data:
+                    last_err_msg = p_data["error"].get("message")
+            except Exception as e:
+                last_err_msg = str(e)
+
+        if not uid_clean:
+            return (
+                False,
+                f"Não foi possível descobrir o ID da conta apenas com este Token ({last_err_msg or 'Token inválido'}). Verifique o Token ou informe também o ID da conta.",
+                None
+            )
+
+    with ACCOUNTS_LOCK:
+        state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
+        # Se a conta já tinha sido excluída antes, reativa automaticamente
+        MEMORY_DELETED_IDS.discard(uid_clean)
+
+        if token_clean:
+            MEMORY_CUSTOM_TOKENS[uid_clean] = token_clean
+        else:
+            env_accs = get_env_accounts()
+            token_clean = (
+                MEMORY_CUSTOM_TOKENS.get(uid_clean, "")
+                or (env_accs.get(uid_clean, {}) or {}).get("access_token", "")
+            )
+
+        existing_acc = state.get("accounts", {}).get(uid_clean, {})
+        now_brt_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
+
+        acc_config = {
+            "ig_user_id": uid_clean,
+            "access_token": token_clean,
+            "username": discovered_username or existing_acc.get("username") or f"user_{uid_clean}",
+            "connected_at": existing_acc.get("connected_at") or now_brt_str,
+            "token_type_label": "Longa Duração (60 dias)"
+        }
+
+    # Coleta imediatamente seguidores, status, cota 24h e todos os Reels/posts da nova conta
+    fetched_acc = fetch_account_current_metrics(acc_config, existing_acc)
+
+    with ACCOUNTS_LOCK:
+        state = get_saved_state(force_redis=False)
+        accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
+        accounts[uid_clean] = merge_best_account_data(accounts.get(uid_clean, {}), fetched_acc)
+
+        if os.path.exists(CODIGO1_ACCOUNTS_FILE) and os.access(BASE_DIR, os.W_OK):
+            try:
+                c1_data = load_json(CODIGO1_ACCOUNTS_FILE, {})
+                if isinstance(c1_data, dict):
+                    target_map = c1_data["accounts"] if ("accounts" in c1_data and isinstance(c1_data["accounts"], dict)) else c1_data
+                    entry_with_tok = dict(accounts[uid_clean])
+                    if token_clean:
+                        entry_with_tok["access_token"] = token_clean
+                    target_map[uid_clean] = entry_with_tok
+                    save_json(CODIGO1_ACCOUNTS_FILE, c1_data)
+            except Exception:
+                pass
+
+        now_ts = time.time()
+        now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
+        new_state = {
+            "last_global_sync_ts": now_ts,
+            "last_global_sync_str": now_str,
+            "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
+            "accounts": sort_accounts_by_views_desc(accounts)
+        }
+        save_current_state(new_state)
+
+    return True, "Conta adicionada e sincronizada com sucesso!", accounts[uid_clean]
 
 
 # ==============================================================================
@@ -1882,6 +2032,7 @@ def refresh_all_accounts_to_json():
             "last_global_sync_ts": now_ts,
             "last_global_sync_str": now_str,
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
+            "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accounts_map
         }
         save_current_state(updated_state)
@@ -1914,7 +2065,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (COM CADÊNCIA SEGURA 3H30 + DESCANSO 12H-24H + FREIO ANTI-QUEDA)
+# TEMPLATE HTML (COM CADÊNCIA SEGURA + ADIÇÃO RÁPIDA DE CONTA NO RODAPÉ)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -2101,6 +2252,60 @@ HTML_TEMPLATE = r"""
             font-size: 0.75rem;
             display: block;
             margin-top: 2px;
+        }
+        .add-account-form {
+            display: grid;
+            grid-template-columns: 2fr 1fr auto;
+            gap: 12px;
+            align-items: end;
+            margin-top: 14px;
+        }
+        @media (max-width: 860px) {
+            .add-account-form {
+                grid-template-columns: 1fr;
+            }
+        }
+        .field-group label {
+            display: block;
+            font-size: 0.79rem;
+            color: var(--muted);
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        .input-dark {
+            width: 100%;
+            padding: 9px 12px;
+            border-radius: 7px;
+            border: 1px solid var(--border);
+            background: #0f172a;
+            color: #f8fafc;
+            font-size: 0.85rem;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+        .input-dark:focus {
+            border-color: #38bdf8;
+        }
+        .btn-add-acc {
+            padding: 9px 18px;
+            border-radius: 7px;
+            background: #22c55e;
+            color: #052e16;
+            border: none;
+            font-weight: 700;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: 0.18s;
+            white-space: nowrap;
+            height: 38px;
+        }
+        .btn-add-acc:hover {
+            background: #16a34a;
+            color: #ffffff;
+        }
+        .btn-add-acc:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
         }
         .modal-overlay {
             position: fixed;
@@ -2476,8 +2681,38 @@ HTML_TEMPLATE = r"""
             </table>
         </div>
         {% else %}
-        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada em <code>ACCOUNTS_CONFIG_JSON</code> (ou <code>contas_conectadas.json</code>) ainda.</p>
+        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada ainda. Adicione sua primeira conta no painel abaixo.</p>
         {% endif %}
+    </div>
+
+    <!-- SEÇÃO NO FINAL DA PÁGINA: ADICIONAR OU RECONECTAR CONTA COM 1 OU 2 DADOS -->
+    <div class="card" style="border-color:rgba(34, 197, 94, 0.45);">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <div>
+                <h2 style="color:#4ade80; font-size:1.1rem;">➕ Adicionar ou Reconectar Conta Rápido</h2>
+                <div class="hint">
+                    Basta colar o <b>Access Token</b> (o sistema descobre o ID, @username, seguidores e vídeos sozinho). Se quiser, você também pode informar o <b>ID da Conta</b> opcionalmente.
+                </div>
+            </div>
+            <span class="badge success">Persistência Automática Upstash + JSON</span>
+        </div>
+
+        <form class="add-account-form" onsubmit="adicionarNovaConta(event)">
+            <div class="field-group">
+                <label for="newAccToken">🔑 Access Token da Conta (IGAA... ou EAA...)</label>
+                <input type="text" id="newAccToken" class="input-dark" placeholder="Cole aqui o Access Token da conta..." autocomplete="off">
+            </div>
+            <div class="field-group">
+                <label for="newAccId">🆔 ID da Conta (Opcional — descoberto pelo Token)</label>
+                <input type="text" id="newAccId" class="input-dark" placeholder="Ex: 17841400000000000 (opcional)" autocomplete="off">
+            </div>
+            <div>
+                <button type="submit" id="btnAddAccount" class="btn-add-acc">
+                    ➕ Conectar e Sincronizar
+                </button>
+            </div>
+        </form>
+        <div id="addAccountStatus" class="hint" style="margin-top:10px; display:none; font-weight:600;"></div>
     </div>
 </div>
 
@@ -2501,6 +2736,7 @@ HTML_TEMPLATE = r"""
 <script>
     let contaPendenteExclusaoId = null;
     let contaPendenteExclusaoUser = null;
+    let adicionandoContaEmAndamento = false;
 
     function abrirModalExclusao(accId, username) {
         contaPendenteExclusaoId = accId;
@@ -2552,6 +2788,62 @@ HTML_TEMPLATE = r"""
             alert('Erro de rede ao tentar excluir conta: ' + e);
             btn.disabled = false;
             btn.innerText = 'Sim, Excluir Conta';
+        }
+    }
+
+    async function adicionarNovaConta(ev) {
+        ev.preventDefault();
+        const tokenEl = document.getElementById('newAccToken');
+        const idEl = document.getElementById('newAccId');
+        const btn = document.getElementById('btnAddAccount');
+        const statusEl = document.getElementById('addAccountStatus');
+
+        const accessToken = (tokenEl.value || '').trim();
+        const igUserId = (idEl.value || '').trim();
+
+        if (!accessToken && !igUserId) {
+            statusEl.style.display = 'block';
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = '⚠️ Informe pelo menos o Access Token ou o ID da conta.';
+            return;
+        }
+
+        adicionandoContaEmAndamento = true;
+        btn.disabled = true;
+        btn.innerText = '⏳ Buscando dados na Meta e salvando...';
+        statusEl.style.display = 'block';
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = '🔄 Conectando à Graph API do Instagram, coletando seguidores, Reels e visualizações...';
+
+        try {
+            const res = await fetch('/api/add_account', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    access_token: accessToken,
+                    ig_user_id: igUserId
+                })
+            });
+            const data = await res.json();
+            if (res.ok && data.ok) {
+                statusEl.style.color = '#4ade80';
+                statusEl.innerText = '✅ Conta @' + (data.username || data.ig_user_id) + ' adicionada com sucesso! Recarregando painel...';
+                tokenEl.value = '';
+                idEl.value = '';
+                setTimeout(() => window.location.reload(), 700);
+            } else {
+                statusEl.style.color = '#f87171';
+                statusEl.innerText = '❌ Erro: ' + (data.error || 'Não foi possível adicionar a conta.');
+                btn.disabled = false;
+                btn.innerText = '➕ Conectar e Sincronizar';
+                adicionandoContaEmAndamento = false;
+            }
+        } catch (e) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = '❌ Erro de rede ao adicionar conta: ' + e;
+            btn.disabled = false;
+            btn.innerText = '➕ Conectar e Sincronizar';
+            adicionandoContaEmAndamento = false;
         }
     }
 
@@ -2611,6 +2903,11 @@ HTML_TEMPLATE = r"""
     setInterval(() => {
         const modal = document.getElementById('deleteModalOverlay');
         if (modal && modal.style.display === 'flex') return;
+        if (adicionandoContaEmAndamento) return;
+
+        // Pausa o reload automático se o usuário estiver digitando no formulário lá embaixo
+        const activeEl = document.activeElement;
+        if (activeEl && (activeEl.id === 'newAccToken' || activeEl.id === 'newAccId')) return;
 
         remaining--;
         const el = document.getElementById('reloadCountdown');
@@ -2626,7 +2923,7 @@ HTML_TEMPLATE = r"""
 
 
 # ==============================================================================
-# ROTAS FLASK E API DE FILA INTELIGENTE + EXCLUSÃO DE CONTAS
+# ROTAS FLASK E API DE FILA INTELIGENTE + ADIÇÃO E EXCLUSÃO DE CONTAS
 # ==============================================================================
 
 @app.route("/", methods=["GET"])
@@ -2708,6 +3005,27 @@ def index():
     )
 
 
+@app.route("/api/add_account", methods=["POST"])
+@requires_auth
+def api_add_account():
+    payload = request.get_json(silent=True) or {}
+    ig_user_id = (payload.get("ig_user_id") or request.form.get("ig_user_id") or "").strip()
+    access_token = (payload.get("access_token") or request.form.get("access_token") or "").strip()
+
+    ok, msg, acc_data = add_or_update_account_minimal(ig_user_id, access_token)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 400
+
+    return jsonify({
+        "ok": True,
+        "message": msg,
+        "ig_user_id": acc_data.get("ig_user_id"),
+        "username": acc_data.get("username"),
+        "followers_count": acc_data.get("followers_count", 0),
+        "total_views": acc_data.get("total_views", 0)
+    })
+
+
 @app.route("/api/delete_account/<acc_id>", methods=["POST", "DELETE"])
 @requires_auth
 def api_delete_account(acc_id):
@@ -2779,8 +3097,9 @@ def export_snapshot():
         env_item = env_accs.get(uid_s, {})
         saved_item = saved_accs.get(uid_s, {})
         merged = merge_best_account_data(env_item, saved_item)
-        if env_item.get("access_token"):
-            merged["access_token"] = env_item["access_token"]
+        tok = MEMORY_CUSTOM_TOKENS.get(uid_s) or env_item.get("access_token")
+        if tok:
+            merged["access_token"] = tok
         export_dict[uid_s] = merged
 
     return jsonify(export_dict)
