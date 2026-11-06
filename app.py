@@ -65,6 +65,8 @@ MEMORY_CUSTOM_TOKENS = {}  # uid_str -> access_token (contas adicionadas via pai
 MEMORY_DELETED_IDS = set()
 MEMORY_LAST_SYNC_TS = 0.0
 MEMORY_LAST_SYNC_STR = "Ainda não sincronizado"
+MEMORY_GLOBAL_PEAK_MIN = 0.0
+MEMORY_GLOBAL_PEAK_HOUR = 0.0
 LAST_REDIS_FETCH_TS = 0.0
 
 # Cache em memória para durações de vídeos já descobertas (media_id -> float seconds)
@@ -412,6 +414,27 @@ def _compute_account_velocity_rates(acc_dict):
             current_vph = max(float(dv_hour), projected_hour)
 
     return round(current_vpm, 2), round(current_vph, 2)
+
+
+def _compute_global_peaks_from_accounts(accounts_dict, prev_peak_min=0.0, prev_peak_hour=0.0):
+    """
+    Calcula o recorde de views/min e views/hora de TODAS as contas somadas.
+    Combina o pico histórico persistido com a soma atual das taxas de todas as contas.
+    """
+    if not isinstance(accounts_dict, dict):
+        return round(_safe_float(prev_peak_min), 2), round(_safe_float(prev_peak_hour), 2)
+
+    sum_cur_min = 0.0
+    sum_cur_hour = 0.0
+
+    for acc in accounts_dict.values():
+        if isinstance(acc, dict):
+            sum_cur_min += _safe_float(acc.get("views_per_min"))
+            sum_cur_hour += _safe_float(acc.get("views_per_hour"))
+
+    best_min = max(_safe_float(prev_peak_min), MEMORY_GLOBAL_PEAK_MIN, sum_cur_min)
+    best_hour = max(_safe_float(prev_peak_hour), MEMORY_GLOBAL_PEAK_HOUR, sum_cur_hour)
+    return round(best_min, 2), round(best_hour, 2)
 
 
 # ==============================================================================
@@ -872,9 +895,11 @@ def load_state_from_upstash():
 def save_state_to_upstash(state_data):
     """
     Salva o estado completo no Upstash Redis usando 1 comando (SET),
-    respeitando as contas removidas (`deleted_ids`) e preservando `custom_tokens`.
+    respeitando as contas removidas (`deleted_ids`), preservando `custom_tokens`
+    e mantendo os recordes globais somados (`global_peak_views_per_min` e `global_peak_views_per_hour`).
     """
-    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
+    global LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR
+    global MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS, MEMORY_GLOBAL_PEAK_MIN, MEMORY_GLOBAL_PEAK_HOUR
     if not is_upstash_configured() or not isinstance(state_data, dict):
         return False
 
@@ -891,6 +916,15 @@ def save_state_to_upstash(state_data):
             if isinstance(remote_state, dict):
                 for d_id in remote_state.get("deleted_ids", []):
                     MEMORY_DELETED_IDS.add(str(d_id).strip())
+
+                MEMORY_GLOBAL_PEAK_MIN = max(
+                    MEMORY_GLOBAL_PEAK_MIN,
+                    _safe_float(remote_state.get("global_peak_views_per_min"))
+                )
+                MEMORY_GLOBAL_PEAK_HOUR = max(
+                    MEMORY_GLOBAL_PEAK_HOUR,
+                    _safe_float(remote_state.get("global_peak_views_per_hour"))
+                )
 
                 remote_tokens = remote_state.get("custom_tokens", {})
                 if isinstance(remote_tokens, dict):
@@ -941,6 +975,14 @@ def save_state_to_upstash(state_data):
             MEMORY_CACHE_ACCOUNTS[uid_str] = clean_merged
 
         sorted_accs = sort_accounts_by_views_desc(cleaned_accs)
+        g_peak_min, g_peak_hour = _compute_global_peaks_from_accounts(
+            sorted_accs,
+            prev_peak_min=_safe_float(state_data.get("global_peak_views_per_min")),
+            prev_peak_hour=_safe_float(state_data.get("global_peak_views_per_hour"))
+        )
+        MEMORY_GLOBAL_PEAK_MIN = g_peak_min
+        MEMORY_GLOBAL_PEAK_HOUR = g_peak_hour
+
         state_to_save = {
             "last_global_sync_ts": max(
                 float(state_data.get("last_global_sync_ts") or 0),
@@ -951,6 +993,8 @@ def save_state_to_upstash(state_data):
                 if (state_data.get("last_global_sync_str") and state_data.get("last_global_sync_str") != "Ainda não sincronizado")
                 else (MEMORY_LAST_SYNC_STR or "—")
             ),
+            "global_peak_views_per_min": g_peak_min,
+            "global_peak_views_per_hour": g_peak_hour,
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accs
@@ -959,6 +1003,8 @@ def save_state_to_upstash(state_data):
         ok_set, _ = upstash_command("SET", REDIS_STATE_KEY, json.dumps(state_to_save, ensure_ascii=False))
         if ok_set:
             state_data["accounts"] = sorted_accs
+            state_data["global_peak_views_per_min"] = g_peak_min
+            state_data["global_peak_views_per_hour"] = g_peak_hour
             state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
             state_data["custom_tokens"] = dict(MEMORY_CUSTOM_TOKENS)
             LAST_REDIS_FETCH_TS = time.time()
@@ -1202,17 +1248,22 @@ def get_env_accounts():
 
 
 def get_saved_state(force_redis=False):
-    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
+    global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, LAST_REDIS_FETCH_TS, REDIS_BOOTSTRAPPED
+    global MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS, MEMORY_GLOBAL_PEAK_MIN, MEMORY_GLOBAL_PEAK_HOUR
 
     with ACCOUNTS_LOCK:
         merged_accounts = {}
         last_ts = MEMORY_LAST_SYNC_TS
         last_str = MEMORY_LAST_SYNC_STR
+        best_global_min = MEMORY_GLOBAL_PEAK_MIN
+        best_global_hour = MEMORY_GLOBAL_PEAK_HOUR
 
         for fpath in (BUNDLED_MONITOR_FILE, RUNTIME_ACCOUNTS_FILE):
             if os.path.exists(fpath):
                 fdata = load_json(fpath, {})
                 if isinstance(fdata, dict):
+                    best_global_min = max(best_global_min, _safe_float(fdata.get("global_peak_views_per_min")))
+                    best_global_hour = max(best_global_hour, _safe_float(fdata.get("global_peak_views_per_hour")))
                     for d_id in fdata.get("deleted_ids", []):
                         MEMORY_DELETED_IDS.add(str(d_id).strip())
                     if isinstance(fdata.get("custom_tokens"), dict):
@@ -1235,6 +1286,8 @@ def get_saved_state(force_redis=False):
                 LAST_REDIS_FETCH_TS = now
                 REDIS_BOOTSTRAPPED = True
                 if isinstance(redis_state, dict):
+                    best_global_min = max(best_global_min, _safe_float(redis_state.get("global_peak_views_per_min")))
+                    best_global_hour = max(best_global_hour, _safe_float(redis_state.get("global_peak_views_per_hour")))
                     for d_id in redis_state.get("deleted_ids", []):
                         MEMORY_DELETED_IDS.add(str(d_id).strip())
                     if isinstance(redis_state.get("custom_tokens"), dict):
@@ -1322,9 +1375,19 @@ def get_saved_state(force_redis=False):
         MEMORY_LAST_SYNC_STR = last_str
 
         sorted_accs = sort_accounts_by_views_desc(merged_accounts)
+        g_peak_min, g_peak_hour = _compute_global_peaks_from_accounts(
+            sorted_accs,
+            prev_peak_min=best_global_min,
+            prev_peak_hour=best_global_hour
+        )
+        MEMORY_GLOBAL_PEAK_MIN = g_peak_min
+        MEMORY_GLOBAL_PEAK_HOUR = g_peak_hour
+
         result_state = {
             "last_global_sync_ts": last_ts,
             "last_global_sync_str": last_str,
+            "global_peak_views_per_min": g_peak_min,
+            "global_peak_views_per_hour": g_peak_hour,
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accs
@@ -1340,6 +1403,7 @@ def get_saved_state(force_redis=False):
 
 def save_current_state(state_data):
     global MEMORY_LAST_SYNC_TS, MEMORY_LAST_SYNC_STR, MEMORY_DELETED_IDS, MEMORY_CUSTOM_TOKENS
+    global MEMORY_GLOBAL_PEAK_MIN, MEMORY_GLOBAL_PEAK_HOUR
 
     with ACCOUNTS_LOCK:
         if isinstance(state_data, dict):
@@ -1373,6 +1437,15 @@ def save_current_state(state_data):
                         MEMORY_CACHE_ACCOUNTS.get(uid_s, {}), clean_acc
                     )
                 state_data["accounts"] = sort_accounts_by_views_desc(MEMORY_CACHE_ACCOUNTS)
+                g_peak_min, g_peak_hour = _compute_global_peaks_from_accounts(
+                    state_data["accounts"],
+                    prev_peak_min=_safe_float(state_data.get("global_peak_views_per_min")),
+                    prev_peak_hour=_safe_float(state_data.get("global_peak_views_per_hour"))
+                )
+                MEMORY_GLOBAL_PEAK_MIN = g_peak_min
+                MEMORY_GLOBAL_PEAK_HOUR = g_peak_hour
+                state_data["global_peak_views_per_min"] = g_peak_min
+                state_data["global_peak_views_per_hour"] = g_peak_hour
                 state_data["deleted_ids"] = sorted(list(MEMORY_DELETED_IDS))
                 state_data["custom_tokens"] = dict(MEMORY_CUSTOM_TOKENS)
 
@@ -1414,6 +1487,8 @@ def delete_account_permanently(acc_id):
         new_state = {
             "last_global_sync_ts": state.get("last_global_sync_ts", MEMORY_LAST_SYNC_TS),
             "last_global_sync_str": state.get("last_global_sync_str", MEMORY_LAST_SYNC_STR),
+            "global_peak_views_per_min": state.get("global_peak_views_per_min", MEMORY_GLOBAL_PEAK_MIN),
+            "global_peak_views_per_hour": state.get("global_peak_views_per_hour", MEMORY_GLOBAL_PEAK_HOUR),
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sort_accounts_by_views_desc(accounts)
@@ -1526,6 +1601,8 @@ def add_or_update_account_minimal(ig_user_id_input, access_token_input):
         new_state = {
             "last_global_sync_ts": now_ts,
             "last_global_sync_str": now_str,
+            "global_peak_views_per_min": state.get("global_peak_views_per_min", MEMORY_GLOBAL_PEAK_MIN),
+            "global_peak_views_per_hour": state.get("global_peak_views_per_hour", MEMORY_GLOBAL_PEAK_HOUR),
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sort_accounts_by_views_desc(accounts)
@@ -2024,6 +2101,11 @@ def refresh_all_accounts_to_json():
                         new_accounts_map[uid_s] = saved_accounts[uid_s]
 
         sorted_accounts_map = sort_accounts_by_views_desc(new_accounts_map)
+        g_peak_min, g_peak_hour = _compute_global_peaks_from_accounts(
+            sorted_accounts_map,
+            prev_peak_min=_safe_float(saved_state.get("global_peak_views_per_min")),
+            prev_peak_hour=_safe_float(saved_state.get("global_peak_views_per_hour"))
+        )
 
         now_ts = time.time()
         now_str = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
@@ -2031,6 +2113,8 @@ def refresh_all_accounts_to_json():
         updated_state = {
             "last_global_sync_ts": now_ts,
             "last_global_sync_str": now_str,
+            "global_peak_views_per_min": g_peak_min,
+            "global_peak_views_per_hour": g_peak_hour,
             "deleted_ids": sorted(list(MEMORY_DELETED_IDS)),
             "custom_tokens": dict(MEMORY_CUSTOM_TOKENS),
             "accounts": sorted_accounts_map
@@ -2065,7 +2149,7 @@ bg_thread.start()
 
 
 # ==============================================================================
-# TEMPLATE HTML (COM CADÊNCIA SEGURA + ADIÇÃO RÁPIDA DE CONTA NO RODAPÉ)
+# TEMPLATE HTML (ORDENAÇÃO CLICÁVEL EM TODAS AS COLUNAS + RECORDES GLOBAIS SOMADOS)
 # ==============================================================================
 
 HTML_TEMPLATE = r"""
@@ -2096,6 +2180,31 @@ HTML_TEMPLATE = r"""
         table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.84rem; }
         th, td { border-bottom: 1px solid var(--border); padding: 10px 7px; text-align: left; vertical-align: middle; }
         th { color: var(--muted); font-weight: 600; }
+        th.sortable-th {
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.15s, color 0.15s;
+            position: relative;
+            white-space: nowrap;
+        }
+        th.sortable-th:hover {
+            background: rgba(56, 189, 248, 0.1);
+            color: #f8fafc;
+        }
+        th.sortable-th.active-sort {
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.14);
+        }
+        .sort-arrow {
+            display: inline-block;
+            margin-left: 4px;
+            font-size: 0.76rem;
+            color: #64748b;
+        }
+        th.sortable-th.active-sort .sort-arrow {
+            color: #38bdf8;
+            font-weight: 800;
+        }
         .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 600; display: inline-block; }
         .badge.success { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.35); }
         .badge.warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
@@ -2487,19 +2596,17 @@ HTML_TEMPLATE = r"""
     <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
             <div>
-                <h2>Contas Conectadas ({{ accounts|length }}) — Ordenadas por Visualizações ↓</h2>
+                <h2 id="mainTableTitle">Contas Conectadas ({{ accounts|length }}) — Clique em qualquer coluna para ordenar ↕</h2>
                 <div class="top-stats-bar">
                     <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
                     <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
                     <span>Views / Min Atuais: <b style="color:#fbbf24;">{{ total_views_per_min | fmt_rate }}/min</b></span>
                     <span>Views / Hora Atuais: <b style="color:#c084fc;">{{ total_views_per_hour | fmt_rate }}/h</b></span>
-                    <span class="record-pill">
-                        🏆 Recorde Min: <b style="color:#fbbf24;">{{ best_record_min_val | fmt_rate }}/min</b>
-                        {% if best_record_min_user %}<span style="color:#94a3b8;">(@{{ best_record_min_user }})</span>{% endif %}
+                    <span class="record-pill" title="Recorde de visualizações por minuto somando todas as contas simultaneamente">
+                        🏆 Recorde Min (Todas as Contas): <b style="color:#fbbf24;">{{ global_peak_min_val | fmt_rate }}/min</b>
                     </span>
-                    <span class="record-pill">
-                        🏆 Recorde Hora: <b style="color:#f472b6;">{{ best_record_hour_val | fmt_rate }}/h</b>
-                        {% if best_record_hour_user %}<span style="color:#94a3b8;">(@{{ best_record_hour_user }})</span>{% endif %}
+                    <span class="record-pill" title="Recorde de visualizações por hora somando todas as contas simultaneamente">
+                        🏆 Recorde Hora (Todas as Contas): <b style="color:#f472b6;">{{ global_peak_hour_val | fmt_rate }}/h</b>
                     </span>
                 </div>
             </div>
@@ -2515,75 +2622,103 @@ HTML_TEMPLATE = r"""
 
         {% if accounts %}
         <div style="overflow-x:auto;">
-            <table>
+            <table id="accountsTable">
                 <thead>
                     <tr>
-                        <th style="width:78px; text-align:center;">Rank / Posts</th>
-                        <th>@Username</th>
-                        <th>Status API & Cota 24h</th>
-                        <th>Seguidores & Conv.</th>
-                        <th>Visualizações Totais ↓</th>
-                        <th>Views / Min (Atual)</th>
-                        <th>Views / Hora (Atual)</th>
-                        <th>🏆 Recordes (Min / Hora)</th>
-                        <th style="min-width:135px;">Índice Atividade & Ritmo</th>
-                        <th>Último Lote & Fadiga 24h</th>
-                        <th style="min-width:250px;">🧠 Recomendação Anti-Queda</th>
-                        <th>Última Coleta</th>
-                        <th style="width:52px; text-align:center;">Excluir</th>
+                        <th class="sortable-th" data-col="0" data-type="number" onclick="ordenarTabelaPorColuna(0)" style="width:92px; text-align:center;" title="Clique para ordenar por quantidade de posts">
+                            Rank / Posts <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="1" data-type="string" onclick="ordenarTabelaPorColuna(1)" title="Clique para ordenar por @Username">
+                            @Username <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="2" data-type="number" onclick="ordenarTabelaPorColuna(2)" title="Clique para ordenar por Status API e Cota 24h">
+                            Status API & Cota 24h <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="3" data-type="number" onclick="ordenarTabelaPorColuna(3)" title="Clique para ordenar por Seguidores">
+                            Seguidores & Conv. <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th active-sort" data-col="4" data-type="number" onclick="ordenarTabelaPorColuna(4)" title="Clique para ordenar por Visualizações Totais">
+                            Visualizações Totais <span class="sort-arrow">▼</span>
+                        </th>
+                        <th class="sortable-th" data-col="5" data-type="number" onclick="ordenarTabelaPorColuna(5)" title="Clique para ordenar por Views / Min">
+                            Views / Min (Atual) <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="6" data-type="number" onclick="ordenarTabelaPorColuna(6)" title="Clique para ordenar por Views / Hora">
+                            Views / Hora (Atual) <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="7" data-type="number" onclick="ordenarTabelaPorColuna(7)" title="Clique para ordenar pelos Recordes da conta">
+                            🏆 Recordes (Min / Hora) <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="8" data-type="number" onclick="ordenarTabelaPorColuna(8)" style="min-width:135px;" title="Clique para ordenar pelo Índice de Atividade (%)">
+                            Índice Atividade & Ritmo <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="9" data-type="number" onclick="ordenarTabelaPorColuna(9)" title="Clique para ordenar pelo tempo desde o último lote">
+                            Último Lote & Fadiga 24h <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="10" data-type="number" onclick="ordenarTabelaPorColuna(10)" style="min-width:250px;" title="Clique para ordenar pela prioridade da Recomendação Anti-Queda">
+                            🧠 Recomendação Anti-Queda <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="11" data-type="number" onclick="ordenarTabelaPorColuna(11)" title="Clique para ordenar pela data/hora da Última Coleta">
+                            Última Coleta <span class="sort-arrow">↕</span>
+                        </th>
+                        <th class="sortable-th" data-col="12" data-type="string" onclick="ordenarTabelaPorColuna(12)" style="width:65px; text-align:center;" title="Clique para ordenar">
+                            Excluir <span class="sort-arrow">↕</span>
+                        </th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="accountsTableBody">
                     {% for acc_id, acc in accounts.items() %}
                     {% set posts_ordenados = acc.get('posts_list', []) %}
                     {% set intel = acc.get('intel', {}) %}
-                    <tr id="acc_row_{{ acc_id }}">
-                        <td style="text-align:center; white-space:nowrap;">
+                    {% set badge_status = acc.get('account_status_badge', 'success') %}
+                    {% set status_rank = 3 if badge_status == 'success' else (2 if badge_status == 'warning' else 1) %}
+                    <tr id="acc_row_{{ acc_id }}" class="acc-main-row" data-acc-id="{{ acc_id }}">
+                        <td style="text-align:center; white-space:nowrap;" data-sort="{{ acc.get('media_count', 0) }}">
                             <div style="display:inline-flex; align-items:center; gap:6px;">
-                                <span class="badge info" style="min-width:30px; text-align:center;">#{{ loop.index }}</span>
+                                <span class="badge info rank-badge-num" style="min-width:30px; text-align:center;">#{{ loop.index }}</span>
                                 <button type="button" id="btn_toggle_{{ acc_id }}" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts e diagnóstico de retenção">
                                     ↓
                                 </button>
                             </div>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.username | lower }}">
                             <b>@{{ acc.username }}</b>
                             <span class="sub-meta">ID: {{ acc.ig_user_id }}</span>
                         </td>
-                        <td>
+                        <td data-sort="{{ status_rank * 1000 + (100 - intel.get('posts_last_24h_count', 0)) }}">
                             <span class="badge {{ acc.get('account_status_badge', 'success') }}" title="{{ acc.get('account_status_detail', '') }}">
                                 {{ acc.get('account_status', 'Ativa') }}
                             </span>
                             <span class="sub-meta">{{ acc.get('account_status_detail', '') }}</span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('followers_count', 0) }}">
                             <span class="metric-val">{{ acc.get('followers_count') | fmt_num }}</span>
                             <span class="sub-meta" title="Seguidores ganhos a cada 1.000 visualizações">
                                 🎯 {{ intel.get('followers_per_1k_views', 0) }} seg / 1k views
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('total_views', 0) }}">
                             <span class="metric-val" style="color:#38bdf8;">{{ acc.get('total_views') | fmt_num }}</span>
                             <span class="sub-meta">
                                 {{ acc.get('media_count', 0) }} posts • 🏆 {{ intel.get('hits_10k', 0) }} hits (+10k)
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('views_per_min', 0) }}">
                             <span class="metric-val" style="color:#fbbf24;">{{ acc.get('views_per_min', 0) | fmt_rate }}/min</span>
                             <span class="sub-meta" style="color:{{ intel.get('trend_color', '#94a3b8') }}; font-weight:600;">
                                 {{ intel.get('trend_label', '—') }}
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('views_per_hour', 0) }}">
                             <span class="metric-val" style="color:#c084fc;">{{ acc.get('views_per_hour', 0) | fmt_rate }}/h</span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('peak_views_per_min', 0) }}">
                             <span style="color:#fde047; font-weight:700;">{{ acc.get('peak_views_per_min', 0) | fmt_rate }}/m</span>
                             <span class="sub-meta" style="color:#f472b6; font-weight:600;">
                                 {{ acc.get('peak_views_per_hour', 0) | fmt_rate }}/h
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ intel.get('activity_index_pct', 0) }}">
                             <div style="display:flex; justify-content:space-between; font-size:0.78rem;">
                                 <span>Saúde vs Pico:</span>
                                 <b style="color:#f8fafc;">{{ intel.get('activity_index_pct', 0) }}%</b>
@@ -2595,7 +2730,7 @@ HTML_TEMPLATE = r"""
                                 Top 1 post = {{ intel.get('top_post_share_pct', 0) }}% das views
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ intel.get('mins_since_last_post') if intel.get('mins_since_last_post') is not none else 9999999 }}">
                             <b style="color:#e2e8f0; font-size:0.81rem;">Último: {{ intel.get('last_post_age_str', '—') }}</b>
                             <span class="sub-meta" style="color:{% if intel.get('batches_24h_count', 0) >= 2 %}#fbbf24{% else %}#4ade80{% endif %}; font-weight:600;">
                                 📦 24h: {{ intel.get('batches_24h_count', 0) }}/2 lotes ({{ intel.get('posts_last_24h_count', 0) }} vídeos)
@@ -2607,7 +2742,7 @@ HTML_TEMPLATE = r"""
                                 ⏰ {{ intel.get('best_window_str', '—') }}
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ intel.get('priority_score', 0) }}">
                             <span class="badge {{ intel.get('action_badge', 'info') }}">
                                 {{ intel.get('action_title', '—') }}
                             </span>
@@ -2615,10 +2750,10 @@ HTML_TEMPLATE = r"""
                                 {{ intel.get('action_detail', '') }}
                             </span>
                         </td>
-                        <td>
+                        <td data-sort="{{ acc.get('updated_at_ts', 0) }}">
                             <span style="font-size:0.8rem;">{{ acc.get('metrics_updated_at', '—') }}</span>
                         </td>
-                        <td style="text-align:center;">
+                        <td style="text-align:center;" data-sort="{{ acc.username | lower }}">
                             <button type="button" class="delete-acc-btn" onclick="abrirModalExclusao('{{ acc_id }}', '{{ acc.username }}')" title="Remover @{{ acc.username }} do painel">
                                 🗑️
                             </button>
@@ -2737,6 +2872,91 @@ HTML_TEMPLATE = r"""
     let contaPendenteExclusaoId = null;
     let contaPendenteExclusaoUser = null;
     let adicionandoContaEmAndamento = false;
+
+    // Estado de ordenação atual (padrão: coluna 4 = Visualizações Totais, decrescente)
+    let currentSortCol = 4;
+    let currentSortDir = 'desc';
+
+    function ordenarTabelaPorColuna(colIndex, forcedDir = null) {
+        const table = document.getElementById('accountsTable');
+        const tbody = document.getElementById('accountsTableBody');
+        if (!table || !tbody) return;
+
+        const headers = table.querySelectorAll('th.sortable-th');
+        const targetHeader = table.querySelector(`th.sortable-th[data-col="${colIndex}"]`);
+        if (!targetHeader) return;
+
+        if (forcedDir) {
+            currentSortCol = colIndex;
+            currentSortDir = forcedDir;
+        } else {
+            if (currentSortCol === colIndex) {
+                currentSortDir = (currentSortDir === 'desc') ? 'asc' : 'desc';
+            } else {
+                currentSortCol = colIndex;
+                // Para texto (@Username), o 1º clique pode começar crescente (A->Z) ou decrescente;
+                // para números, começa decrescente (maior -> menor), e alterna a cada clique.
+                const sortType = targetHeader.getAttribute('data-type') || 'number';
+                currentSortDir = (sortType === 'string') ? 'asc' : 'desc';
+            }
+        }
+
+        const sortType = targetHeader.getAttribute('data-type') || 'number';
+        const mainRows = Array.from(tbody.querySelectorAll('tr.acc-main-row'));
+
+        const rowPairs = mainRows.map(mainRow => {
+            const accId = mainRow.getAttribute('data-acc-id');
+            const detailRow = document.getElementById('posts_row_' + accId);
+            const cell = mainRow.children[colIndex];
+            let rawVal = cell ? (cell.getAttribute('data-sort') ?? cell.innerText.trim()) : '';
+
+            let parsedVal;
+            if (sortType === 'number') {
+                const num = parseFloat(String(rawVal).replace(',', '.'));
+                parsedVal = isNaN(num) ? 0 : num;
+            } else {
+                parsedVal = String(rawVal).toLowerCase();
+            }
+
+            return { mainRow, detailRow, parsedVal };
+        });
+
+        rowPairs.sort((a, b) => {
+            if (a.parsedVal < b.parsedVal) return currentSortDir === 'asc' ? -1 : 1;
+            if (a.parsedVal > b.parsedVal) return currentSortDir === 'asc' ? 1 : -1;
+            return 0;
+        });
+
+        rowPairs.forEach((pair, idx) => {
+            tbody.appendChild(pair.mainRow);
+            if (pair.detailRow) {
+                tbody.appendChild(pair.detailRow);
+            }
+            const rankBadge = pair.mainRow.querySelector('.rank-badge-num');
+            if (rankBadge) {
+                rankBadge.innerText = '#' + (idx + 1);
+            }
+        });
+
+        headers.forEach(th => {
+            th.classList.remove('active-sort');
+            const arrow = th.querySelector('.sort-arrow');
+            if (arrow) arrow.innerText = '↕';
+        });
+
+        targetHeader.classList.add('active-sort');
+        const activeArrow = targetHeader.querySelector('.sort-arrow');
+        if (activeArrow) {
+            activeArrow.innerText = currentSortDir === 'asc' ? '▲' : '▼';
+        }
+
+        try {
+            sessionStorage.setItem('table_sort_state', JSON.stringify({
+                col: currentSortCol,
+                dir: currentSortDir
+            }));
+        } catch (e) {}
+    }
 
     function abrirModalExclusao(accId, username) {
         contaPendenteExclusaoId = accId;
@@ -2887,6 +3107,13 @@ HTML_TEMPLATE = r"""
 
     window.addEventListener('DOMContentLoaded', () => {
         try {
+            const savedSort = JSON.parse(sessionStorage.getItem('table_sort_state') || 'null');
+            if (savedSort && typeof savedSort.col === 'number' && (savedSort.dir === 'asc' || savedSort.dir === 'desc')) {
+                ordenarTabelaPorColuna(savedSort.col, savedSort.dir);
+            }
+        } catch (e) {}
+
+        try {
             const openState = JSON.parse(sessionStorage.getItem('open_posts_rows') || '{}');
             Object.keys(openState).forEach(accId => {
                 if (openState[accId]) {
@@ -2929,6 +3156,8 @@ HTML_TEMPLATE = r"""
 @app.route("/", methods=["GET"])
 @requires_auth
 def index():
+    global MEMORY_GLOBAL_PEAK_MIN, MEMORY_GLOBAL_PEAK_HOUR
+
     state = get_saved_state(force_redis=not REDIS_BOOTSTRAPPED)
     last_ts = state.get("last_global_sync_ts", 0)
     accounts = state.get("accounts", {})
@@ -2938,11 +3167,6 @@ def index():
 
     accounts = sort_accounts_by_views_desc(state.get("accounts", {}))
     last_sync_str = state.get("last_global_sync_str", "—")
-
-    best_record_min_val = 0.0
-    best_record_min_user = ""
-    best_record_hour_val = 0.0
-    best_record_hour_user = ""
 
     ready_to_post_list = []
     maturing_cooldown_list = []
@@ -2958,6 +3182,7 @@ def index():
             peak_hour = round(max(_safe_float(acc.get("peak_views_per_hour")), v_hour), 2)
             acc["peak_views_per_min"] = peak_min
             acc["peak_views_per_hour"] = peak_hour
+            acc["updated_at_ts"] = _parse_br_datetime_to_ts(acc.get("metrics_updated_at")) or 0
 
             intel = _analyze_account_intelligence(acc)
             acc["intel"] = intel
@@ -2970,20 +3195,27 @@ def index():
             elif acode in ("PAUSE_ZOMBIE", "THROTTLE_REST", "RECONNECT", "QUOTA_FULL"):
                 paused_or_down_list.append(acc)
 
-            uname = str(acc.get("username") or "").strip()
-            if peak_min > best_record_min_val:
-                best_record_min_val = peak_min
-                best_record_min_user = uname
-            if peak_hour > best_record_hour_val:
-                best_record_hour_val = peak_hour
-                best_record_hour_user = uname
-
     ready_to_post_list.sort(key=lambda x: x.get("intel", {}).get("priority_score", 0), reverse=True)
 
     total_followers = sum(_safe_int(acc.get("followers_count")) for acc in accounts.values())
     total_views = sum(_safe_int(acc.get("total_views")) for acc in accounts.values())
     total_views_per_min = round(sum(_safe_float(acc.get("views_per_min")) for acc in accounts.values()), 2)
     total_views_per_hour = round(sum(_safe_float(acc.get("views_per_hour")) for acc in accounts.values()), 2)
+
+    prev_g_min = _safe_float(state.get("global_peak_views_per_min"))
+    prev_g_hour = _safe_float(state.get("global_peak_views_per_hour"))
+    global_peak_min_val, global_peak_hour_val = _compute_global_peaks_from_accounts(
+        accounts,
+        prev_peak_min=prev_g_min,
+        prev_peak_hour=prev_g_hour
+    )
+
+    if global_peak_min_val > prev_g_min or global_peak_hour_val > prev_g_hour:
+        MEMORY_GLOBAL_PEAK_MIN = global_peak_min_val
+        MEMORY_GLOBAL_PEAK_HOUR = global_peak_hour_val
+        state["global_peak_views_per_min"] = global_peak_min_val
+        state["global_peak_views_per_hour"] = global_peak_hour_val
+        save_current_state(state)
 
     return render_template_string(
         HTML_TEMPLATE,
@@ -2993,10 +3225,8 @@ def index():
         total_views=total_views,
         total_views_per_min=total_views_per_min,
         total_views_per_hour=total_views_per_hour,
-        best_record_min_val=best_record_min_val,
-        best_record_min_user=best_record_min_user,
-        best_record_hour_val=best_record_hour_val,
-        best_record_hour_user=best_record_hour_user,
+        global_peak_min_val=global_peak_min_val,
+        global_peak_hour_val=global_peak_hour_val,
         ready_to_post_list=ready_to_post_list,
         maturing_cooldown_list=maturing_cooldown_list,
         paused_or_down_list=paused_or_down_list,
