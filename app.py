@@ -2158,1250 +2158,511 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SUBSTRATA // MONITOR 24H & INTELIGÊNCIA ANTI-QUEDA</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <title>Monitor 24h & Inteligência Anti-Queda — Contas Conectadas</title>
     <style>
         :root {
-            --background: hsl(0, 0%, 3%);          /* #080808 true black */
-            --foreground: hsl(0, 0%, 96%);         /* #f5f5f5 */
-            --primary: hsl(88, 96%, 56%);          /* #b6f81f acid green */
-            --primary-dim: hsla(88, 96%, 56%, 0.12);
-            --primary-border: hsla(88, 96%, 56%, 0.4);
-            --primary-foreground: hsl(0, 0%, 4%);  /* #0a0a0a */
-            --muted-foreground: hsl(0, 0%, 52%);   /* #858585 */
-            --border: hsl(0, 0%, 14%);             /* #242424 */
-            --card: hsl(0, 0%, 7%);                /* #121212 */
-            --card-elevated: hsl(0, 0%, 11%);      /* #1c1c1c */
-            --sold-out: hsl(340, 88%, 58%);        /* #f23678 magenta */
-            --sold-out-dim: hsla(340, 88%, 58%, 0.14);
-            --amber: hsl(42, 96%, 56%);            /* #f9b824 warning */
-            --amber-dim: hsla(42, 96%, 56%, 0.14);
-            --cyan: hsl(192, 95%, 55%);            /* #20d4f8 info */
-            --cyan-dim: hsla(192, 95%, 55%, 0.14);
-
-            --font-display: 'Anton', Impact, sans-serif;
-            --font-mono: 'Space Mono', monospace;
-            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        html {
-            scroll-behavior: smooth;
-            background-color: var(--background);
-            color: var(--foreground);
-        }
-
-        body {
-            background-color: var(--background);
-            color: var(--foreground);
-            font-family: var(--font-sans);
-            font-weight: 400;
-            font-size: 15px;
-            line-height: 1.6;
-            min-height: 100vh;
-            overflow-x: hidden;
-            position: relative;
-            background-image: 
-                radial-gradient(circle at 50% 0%, hsla(88, 96%, 56%, 0.04) 0%, transparent 55%),
-                linear-gradient(to bottom, rgba(255,255,255,0.015) 1px, transparent 1px);
-            background-size: 100% 100%, 100% 48px;
-        }
-
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: var(--background); }
-        ::-webkit-scrollbar-thumb { background: var(--border); }
-        ::-webkit-scrollbar-thumb:hover { background: var(--primary); }
-
-        /* Effect 2 — Acid Green Scanline Sweep on Load */
-        .scanline-sweep {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background: var(--primary);
-            box-shadow: 0 0 20px 3px var(--primary);
-            z-index: 99999;
-            pointer-events: none;
-            animation: substrataScan 1.25s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-        }
-
-        @keyframes substrataScan {
-            0% { top: -2%; opacity: 1; }
-            85% { opacity: 1; }
-            100% { top: 102%; opacity: 0; visibility: hidden; }
-        }
-
-        @media (prefers-reduced-motion: reduce) {
-            .scanline-sweep { display: none !important; }
-        }
-
-        /* Typography Utility Classes */
-        .eyebrow {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 400;
-            text-transform: uppercase;
-            letter-spacing: 0.2em;
-            color: var(--primary);
-            display: block;
-            margin-bottom: 6px;
-        }
-
-        .h1-display {
-            font-family: var(--font-display);
-            font-weight: 400;
-            text-transform: uppercase;
-            font-size: clamp(42px, 6vw, 88px);
-            letter-spacing: -0.02em;
-            line-height: 0.88;
-            color: var(--foreground);
-        }
-
-        .h2-display {
-            font-family: var(--font-display);
-            font-weight: 400;
-            text-transform: uppercase;
-            font-size: clamp(26px, 3vw, 40px);
-            letter-spacing: -0.01em;
-            line-height: 0.95;
-            color: var(--foreground);
-        }
-
-        .h3-display {
-            font-family: var(--font-display);
-            font-weight: 400;
-            text-transform: uppercase;
-            font-size: 22px;
-            letter-spacing: 0.01em;
-            line-height: 1;
-        }
-
-        .mono-num {
-            font-family: var(--font-mono);
-            font-weight: 700;
-            text-transform: uppercase;
-            font-variant-numeric: tabular-nums;
-        }
-
-        /* 1. Navbar (68px fixed, true black, acid green 1px bottom border) */
-        .navbar {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 68px;
-            background: rgba(8, 8, 8, 0.92);
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid var(--border);
-            z-index: 1000;
-            transition: border-color 0.25s ease;
-        }
-
-        .navbar.scrolled {
-            border-bottom-color: var(--primary);
-        }
-
-        .navbar-inner {
-            max-width: 1720px;
-            height: 100%;
-            margin: 0 auto;
-            padding: 0 28px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 16px;
-        }
-
-        .brand-logo {
-            display: flex;
-            align-items: baseline;
-            gap: 12px;
-            text-decoration: none;
-            color: var(--foreground);
-        }
-
-        .brand-logo-title {
-            font-family: var(--font-display);
-            font-size: 28px;
-            letter-spacing: -0.02em;
-            text-transform: uppercase;
-            line-height: 1;
-        }
-
-        .brand-logo-tag {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            letter-spacing: 0.18em;
-            color: var(--primary);
-            text-transform: uppercase;
-            padding: 2px 6px;
-            border: 1px solid var(--primary-border);
-            background: var(--primary-dim);
-        }
-
-        .nav-links {
-            display: flex;
-            align-items: center;
-            gap: 28px;
-        }
-
-        .nav-links a {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.16em;
-            color: var(--muted-foreground);
-            text-decoration: none;
-            transition: color 0.2s;
-        }
-
-        .nav-links a:hover {
-            color: var(--primary);
-        }
-
-        .nav-actions {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        /* Buttons — Sharp Square Industrial Style */
-        .btn-square {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            padding: 10px 16px;
-            border-radius: 0;
-            border: 1px solid var(--primary);
-            background: var(--primary);
-            color: var(--primary-foreground);
-            cursor: pointer;
-            transition: all 0.2s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            white-space: nowrap;
-        }
-
-        .btn-square:hover {
-            background: transparent;
-            color: var(--primary);
-            box-shadow: 0 0 18px var(--primary-dim);
-        }
-
-        .btn-square:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .btn-square.outline {
-            background: var(--card);
-            color: var(--foreground);
-            border-color: var(--border);
-        }
-
-        .btn-square.outline:hover {
-            border-color: var(--primary);
-            color: var(--primary);
-            background: var(--card-elevated);
-        }
-
-        /* 2. Next Event / Live Telemetry Strip */
-        .telemetry-strip {
-            margin-top: 68px;
-            background: var(--card);
-            border-bottom: 1px solid var(--border);
-            padding: 10px 28px;
-            font-family: var(--font-mono);
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-        }
-
-        .telemetry-inner {
-            max-width: 1720px;
-            margin: 0 auto;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-
-        .telemetry-group {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 16px;
-        }
-
-        .pulse-dot {
-            width: 8px;
-            height: 8px;
-            background: var(--primary);
-            display: inline-block;
-            box-shadow: 0 0 8px var(--primary);
-            animation: pulseDot 2s infinite;
-        }
-
-        @keyframes pulseDot {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.35; }
-        }
-
-        /* Layout Container */
-        .container {
-            max-width: 1720px;
-            margin: 0 auto;
-            padding: 36px 28px 80px;
-            display: flex;
-            flex-direction: column;
-            gap: 44px;
-        }
-
-        /* 3. Hero & Global KPIs */
-        .hero-section {
-            display: grid;
-            grid-template-columns: 1.2fr 1.8fr;
-            gap: 32px;
-            align-items: end;
-            padding-bottom: 32px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .hero-copy p.hint {
-            margin-top: 16px;
-            color: var(--muted-foreground);
-            font-size: 14px;
-            max-width: 640px;
-            line-height: 1.65;
-        }
-
-        .hero-copy p.hint b {
-            color: var(--foreground);
-            font-weight: 500;
-        }
-
-        .kpi-matrix {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1px;
-            background: var(--border);
-            border: 1px solid var(--border);
-        }
-
-        .kpi-cell {
-            background: var(--card);
-            padding: 18px 20px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            gap: 6px;
-            transition: background 0.2s, border-color 0.2s;
-            position: relative;
-        }
-
-        .kpi-cell:hover {
-            background: var(--card-elevated);
-        }
-
-        .kpi-cell.record-cell {
-            background: linear-gradient(180deg, rgba(182, 248, 31, 0.05) 0%, var(--card) 100%);
-        }
-
-        .kpi-label {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.18em;
-            color: var(--muted-foreground);
-        }
-
-        .kpi-value {
-            font-family: var(--font-display);
-            font-size: clamp(28px, 2.6vw, 42px);
-            line-height: 0.95;
-            letter-spacing: -0.01em;
-            color: var(--foreground);
-            text-transform: uppercase;
-        }
-
-        .kpi-value.acid { color: var(--primary); }
-        .kpi-value.cyan { color: var(--cyan); }
-        .kpi-value.amber { color: var(--amber); }
-        .kpi-value.magenta { color: var(--sold-out); }
-
-        /* Badges */
-        .badge {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            padding: 4px 8px;
-            border-radius: 0;
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            line-height: 1.2;
-            white-space: nowrap;
-        }
-
-        .badge.success {
-            background: var(--primary-dim);
-            color: var(--primary);
-            border: 1px solid var(--primary-border);
-        }
-
-        .badge.warning {
-            background: var(--amber-dim);
-            color: var(--amber);
-            border: 1px solid hsla(42, 96%, 56%, 0.4);
-        }
-
-        .badge.info {
-            background: var(--cyan-dim);
-            color: var(--cyan);
-            border: 1px solid hsla(192, 95%, 55%, 0.4);
-        }
-
-        .badge.error {
-            background: var(--sold-out-dim);
-            color: var(--sold-out);
-            border: 1px solid hsla(340, 88%, 58%, 0.45);
-        }
-
-        /* Section Cards ("The Rooms" / Technical Blocks) */
-        .section-block {
-            background: var(--card);
-            border: 1px solid var(--border);
-            padding: 28px;
-            position: relative;
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-end;
-            flex-wrap: wrap;
-            gap: 16px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .hint {
-            font-size: 13px;
-            color: var(--muted-foreground);
-            margin-top: 6px;
-            line-height: 1.5;
-        }
-
-        /* 4. The 3 Rooms — Central Tática de Alocação de Lotes */
-        .intel-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-top: 24px;
-        }
-
-        .intel-box {
-            background: var(--background);
-            border: 1px solid var(--border);
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            transition: border-color 0.25s ease;
-        }
-
-        .intel-box.room-ready:hover { border-color: var(--primary); }
-        .intel-box.room-cooldown:hover { border-color: var(--amber); }
-        .intel-box.room-brake:hover { border-color: var(--sold-out); }
-
-        .room-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            gap: 12px;
-            padding-bottom: 14px;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 12px;
-        }
-
-        .room-list {
-            display: flex;
-            flex-direction: column;
-            max-height: 340px;
-            overflow-y: auto;
-            padding-right: 4px;
-        }
-
-        .intel-item {
-            padding: 12px 0;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-            transition: transform 0.2s ease;
-        }
-
-        .intel-item:hover {
-            transform: translateX(4px);
-        }
-
-        .intel-item:last-child {
-            border-bottom: none;
-        }
-
-        .intel-handle {
-            font-family: var(--font-display);
-            font-size: 20px;
-            letter-spacing: 0.02em;
-            text-transform: uppercase;
-            color: var(--foreground);
-            display: block;
-            line-height: 1.1;
-        }
-
-        .sub-meta {
-            font-family: var(--font-mono);
-            color: var(--muted-foreground);
-            font-size: 11px;
-            display: block;
-            margin-top: 3px;
-            line-height: 1.35;
-        }
-
-        /* 5. Main Lineup Table — Accounts Connected */
-        .table-controls-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-top: 20px;
-            margin-bottom: 16px;
-        }
-
-        .search-filter-input {
-            background: var(--background);
-            border: 1px solid var(--border);
-            color: var(--foreground);
-            font-family: var(--font-mono);
-            font-size: 12px;
-            padding: 10px 14px;
-            width: 320px;
-            max-width: 100%;
-            outline: none;
-            text-transform: uppercase;
-            transition: border-color 0.2s;
-        }
-
-        .search-filter-input:focus {
-            border-color: var(--primary);
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-
-        th, td {
-            border-bottom: 1px solid var(--border);
-            padding: 14px 10px;
-            text-align: left;
-            vertical-align: middle;
-        }
-
-        th {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.14em;
-            color: var(--muted-foreground);
-            font-weight: 700;
-            background: var(--background);
-            border-top: 1px solid var(--border);
-        }
-
+            --bg: #0f172a;
+            --card: #1e293b;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --border: #334155;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --info: #38bdf8;
+            --error: #ef4444;
+        }
+        * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
+        body { background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+        .container { max-width: 1680px; margin: 0 auto; display: grid; gap: 18px; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+        h1, h2, h3 { margin: 0; }
+        .hint { font-size: 0.82rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.84rem; }
+        th, td { border-bottom: 1px solid var(--border); padding: 10px 7px; text-align: left; vertical-align: middle; }
+        th { color: var(--muted); font-weight: 600; }
         th.sortable-th {
             cursor: pointer;
             user-select: none;
             transition: background 0.15s, color 0.15s;
+            position: relative;
             white-space: nowrap;
         }
-
         th.sortable-th:hover {
-            background: var(--card-elevated);
-            color: var(--foreground);
+            background: rgba(56, 189, 248, 0.1);
+            color: #f8fafc;
         }
-
         th.sortable-th.active-sort {
-            color: var(--primary);
-            background: var(--primary-dim);
-            border-bottom: 2px solid var(--primary);
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.14);
         }
-
         .sort-arrow {
             display: inline-block;
             margin-left: 4px;
-            font-size: 10px;
-            color: var(--muted-foreground);
+            font-size: 0.76rem;
+            color: #64748b;
         }
-
         th.sortable-th.active-sort .sort-arrow {
-            color: var(--primary);
+            color: #38bdf8;
+            font-weight: 800;
         }
-
-        /* Lineup Row Hover Effect (Substrata Effect 1 Adaptation) */
-        tr.acc-main-row {
-            background: var(--card);
-            transition: background 0.25s ease;
+        .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 600; display: inline-block; }
+        .badge.success { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.35); }
+        .badge.warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+        .badge.info { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); }
+        .badge.error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }
+        .metric-val { font-weight: 700; color: #f8fafc; font-size: 0.93rem; }
+        button.small-btn {
+            margin-top: 0; padding: 7px 13px; width: auto; font-size: 0.82rem; border-radius: 6px;
+            background: #3b82f6; color: white; border: none; font-weight: 600; cursor: pointer; transition: 0.2s;
         }
-
-        tr.acc-main-row:hover {
-            background: linear-gradient(90deg, hsla(88, 96%, 56%, 0.08) 0%, rgba(28, 28, 28, 0.9) 45%, var(--card) 100%);
-        }
-
-        .artist-handle {
-            font-family: var(--font-display);
-            font-size: 23px;
-            text-transform: uppercase;
-            letter-spacing: 0.01em;
-            color: var(--foreground);
-            display: inline-block;
-            transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), color 0.25s ease;
-            line-height: 1;
-        }
-
-        tr.acc-main-row:hover .artist-handle {
-            transform: translateX(8px);
-            color: var(--primary);
-        }
-
-        tr.acc-main-row.row-error .artist-handle {
-            color: var(--sold-out);
-        }
-
-        .metric-val {
-            font-family: var(--font-mono);
-            font-weight: 700;
-            color: var(--foreground);
-            font-size: 14px;
-            font-variant-numeric: tabular-nums;
-            display: block;
-        }
-
-        /* Action Buttons inside Table */
+        button.small-btn:hover { background: #2563eb; }
+        button.small-btn.secondary { background: #0f766e; }
+        button.small-btn.secondary:hover { background: #115e59; }
         .posts-toggle-btn {
-            padding: 5px 9px;
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 700;
-            border-radius: 0;
-            background: var(--background);
-            color: var(--primary);
-            border: 1px solid var(--border);
+            margin-top: 0;
+            padding: 3px 7px;
+            width: auto;
+            font-size: 0.78rem;
+            border-radius: 5px;
+            background: #334155;
+            color: #38bdf8;
+            border: 1px solid #475569;
             cursor: pointer;
             line-height: 1;
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            transition: all 0.15s;
+            transition: 0.15s;
         }
-
         .posts-toggle-btn:hover {
-            background: var(--primary);
-            color: var(--primary-foreground);
-            border-color: var(--primary);
+            background: #475569;
+            color: #ffffff;
+            border-color: #38bdf8;
         }
-
         .delete-acc-btn {
-            padding: 7px 10px;
-            border-radius: 0;
-            background: var(--sold-out-dim);
-            color: var(--sold-out);
-            border: 1px solid hsla(340, 88%, 58%, 0.4);
+            padding: 6px 9px;
+            border-radius: 6px;
+            background: rgba(239, 68, 68, 0.16);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.4);
             cursor: pointer;
-            font-family: var(--font-mono);
-            font-size: 12px;
+            font-size: 0.85rem;
             line-height: 1;
-            transition: all 0.18s;
+            transition: 0.18s;
             display: inline-flex;
             align-items: center;
             justify-content: center;
         }
-
         .delete-acc-btn:hover {
-            background: var(--sold-out);
+            background: #ef4444;
             color: #ffffff;
-            border-color: var(--sold-out);
+            border-color: #ef4444;
+            transform: scale(1.05);
         }
-
-        /* Progress Bar */
-        .progress-bar-bg {
-            width: 100%;
-            height: 6px;
-            background: var(--background);
-            border-radius: 0;
-            overflow: hidden;
-            margin-top: 6px;
-            border: 1px solid var(--border);
-        }
-
-        .progress-bar-fill {
-            height: 100%;
-            border-radius: 0;
-        }
-
-        /* Posts Dropdown Box (Tracklist Drawer) */
-        .posts-dropdown-row {
-            background: var(--background);
-        }
-
+        .posts-dropdown-row { background: #0b1120; }
         .posts-dropdown-box {
-            padding: 18px 20px;
-            background: #050505;
+            padding: 12px 14px;
+            border-radius: 8px;
+            background: #111a2e;
             border: 1px solid var(--border);
-            border-left: 3px solid var(--primary);
-            max-height: 360px;
+            max-height: 320px;
             overflow-y: auto;
         }
-
         .post-rank-item {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 14px;
-            padding: 10px 12px;
-            border-bottom: 1px solid var(--border);
-            font-family: var(--font-mono);
-            font-size: 12px;
-            transition: background 0.15s;
+            gap: 12px;
+            padding: 8px 10px;
+            border-bottom: 1px solid #1e293b;
+            font-size: 0.83rem;
         }
-
-        .post-rank-item:hover {
-            background: var(--card);
-        }
-
-        .post-rank-item:last-child {
-            border-bottom: none;
-        }
-
+        .post-rank-item:last-child { border-bottom: none; }
         .post-rank-link {
-            color: var(--foreground);
+            color: #38bdf8;
             text-decoration: none;
-            font-weight: 400;
+            font-weight: 600;
             word-break: break-all;
-            border-bottom: 1px dashed var(--muted-foreground);
-            transition: color 0.15s, border-color 0.15s;
         }
-
         .post-rank-link:hover {
-            color: var(--primary);
-            border-bottom-color: var(--primary);
+            text-decoration: underline;
+            color: #7dd3fc;
         }
-
         .duration-pill {
-            background: var(--card-elevated);
-            color: var(--foreground);
-            border: 1px solid var(--border);
+            background: rgba(168, 85, 247, 0.18);
+            color: #e9d5ff;
+            border: 1px solid rgba(168, 85, 247, 0.4);
             padding: 3px 8px;
-            font-family: var(--font-mono);
-            font-size: 11px;
+            border-radius: 6px;
+            font-size: 0.76rem;
             font-weight: 700;
             white-space: nowrap;
         }
-
-        /* 6. Booking / Token Connection Form */
-        .add-account-form {
+        .top-stats-bar {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            font-size: 0.85rem;
+            color: var(--muted);
+            margin-top: 8px;
+            align-items: center;
+        }
+        .record-pill {
+            background: rgba(245, 158, 11, 0.12);
+            border: 1px solid rgba(245, 158, 11, 0.35);
+            padding: 4px 10px;
+            border-radius: 8px;
+            color: #fde68a;
+        }
+        .intel-grid {
             display: grid;
-            grid-template-columns: 2fr 1fr auto;
-            gap: 16px;
-            align-items: end;
-            margin-top: 22px;
+            grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+            gap: 14px;
+            margin-top: 12px;
         }
-
-        .field-group label {
-            display: block;
-            font-family: var(--font-mono);
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.14em;
-            color: var(--muted-foreground);
-            margin-bottom: 8px;
-        }
-
-        .input-dark {
-            width: 100%;
-            padding: 12px 14px;
-            border-radius: 0;
+        .intel-box {
+            background: #0f172a;
             border: 1px solid var(--border);
-            background: var(--background);
-            color: var(--foreground);
-            font-family: var(--font-mono);
-            font-size: 13px;
-            outline: none;
-            transition: border-color 0.2s;
+            border-radius: 10px;
+            padding: 13px 15px;
         }
-
-        .input-dark:focus {
-            border-color: var(--primary);
-        }
-
-        .btn-add-acc {
-            padding: 0 24px;
-            height: 45px;
-            border-radius: 0;
-            background: var(--primary);
-            color: var(--primary-foreground);
-            border: 1px solid var(--primary);
-            font-family: var(--font-mono);
-            font-weight: 700;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.14em;
-            cursor: pointer;
-            transition: all 0.2s;
-            white-space: nowrap;
-        }
-
-        .btn-add-acc:hover {
-            background: transparent;
-            color: var(--primary);
-        }
-
-        .btn-add-acc:disabled {
-            opacity: 0.55;
-            cursor: not-allowed;
-        }
-
-        /* 7. Door Policy & Anti-Drop Protocol Footer */
-        .policy-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 24px;
-            margin-top: 20px;
-        }
-
-        .policy-card {
-            background: var(--background);
-            border: 1px solid var(--border);
-            padding: 20px;
-        }
-
-        .policy-card h4 {
-            font-family: var(--font-display);
-            font-size: 20px;
-            text-transform: uppercase;
-            color: var(--foreground);
+        .intel-box h3 {
+            font-size: 0.92rem;
             margin-bottom: 8px;
-            letter-spacing: 0.02em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
-
-        .policy-card p {
-            font-size: 13px;
-            color: var(--muted-foreground);
-            line-height: 1.6;
-        }
-
-        .substrata-footer {
-            border-top: 1px solid var(--primary);
-            background: var(--background);
-            padding: 32px 28px;
-            font-family: var(--font-mono);
-            font-size: 11px;
-            color: var(--muted-foreground);
-            text-transform: uppercase;
-            letter-spacing: 0.14em;
-        }
-
-        .substrata-footer-inner {
-            max-width: 1720px;
-            margin: 0 auto;
+        .intel-item {
+            font-size: 0.82rem;
+            padding: 6px 0;
+            border-bottom: 1px dashed #1e293b;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 16px;
+            gap: 8px;
         }
-
-        /* Modal Overlay */
+        .intel-item:last-child { border-bottom: none; }
+        .progress-bar-bg {
+            width: 100%;
+            height: 6px;
+            background: #0f172a;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 4px;
+            border: 1px solid #334155;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+        }
+        .sub-meta {
+            color: var(--muted);
+            font-size: 0.75rem;
+            display: block;
+            margin-top: 2px;
+        }
+        .add-account-form {
+            display: grid;
+            grid-template-columns: 2fr 1fr auto;
+            gap: 12px;
+            align-items: end;
+            margin-top: 14px;
+        }
+        @media (max-width: 860px) {
+            .add-account-form {
+                grid-template-columns: 1fr;
+            }
+        }
+        .field-group label {
+            display: block;
+            font-size: 0.79rem;
+            color: var(--muted);
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        .input-dark {
+            width: 100%;
+            padding: 9px 12px;
+            border-radius: 7px;
+            border: 1px solid var(--border);
+            background: #0f172a;
+            color: #f8fafc;
+            font-size: 0.85rem;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+        .input-dark:focus {
+            border-color: #38bdf8;
+        }
+        .btn-add-acc {
+            padding: 9px 18px;
+            border-radius: 7px;
+            background: #22c55e;
+            color: #052e16;
+            border: none;
+            font-weight: 700;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: 0.18s;
+            white-space: nowrap;
+            height: 38px;
+        }
+        .btn-add-acc:hover {
+            background: #16a34a;
+            color: #ffffff;
+        }
+        .btn-add-acc:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+        }
         .modal-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(4, 4, 4, 0.86);
+            background: rgba(2, 6, 23, 0.78);
             display: none;
             align-items: center;
             justify-content: center;
             z-index: 9999;
             padding: 16px;
-            backdrop-filter: blur(5px);
+            backdrop-filter: blur(3px);
         }
-
         .modal-card {
-            background: var(--card);
-            border: 1px solid var(--sold-out);
-            border-radius: 0;
-            max-width: 460px;
+            background: #1e293b;
+            border: 1px solid #ef4444;
+            border-radius: 12px;
+            max-width: 440px;
             width: 100%;
-            padding: 28px;
-            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.85);
+            padding: 22px 24px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
         }
-
         .modal-title {
-            font-family: var(--font-display);
-            font-size: 28px;
-            text-transform: uppercase;
-            color: var(--sold-out);
-            margin-bottom: 12px;
-            line-height: 1;
+            font-size: 1.08rem;
+            font-weight: 700;
+            color: #f87171;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
         }
-
         .modal-body {
-            font-size: 14px;
-            color: var(--foreground);
-            line-height: 1.6;
-            margin-bottom: 24px;
+            font-size: 0.88rem;
+            color: #cbd5e1;
+            line-height: 1.5;
+            margin-bottom: 18px;
         }
-
         .modal-actions {
             display: flex;
             justify-content: flex-end;
-            gap: 12px;
+            gap: 10px;
         }
-
         .btn-cancel {
-            padding: 10px 18px;
-            border-radius: 0;
-            background: var(--background);
-            color: var(--foreground);
-            border: 1px solid var(--border);
-            font-family: var(--font-mono);
-            font-weight: 700;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
+            padding: 8px 15px;
+            border-radius: 7px;
+            background: #334155;
+            color: #e2e8f0;
+            border: 1px solid #475569;
+            font-weight: 600;
+            font-size: 0.84rem;
             cursor: pointer;
         }
-
-        .btn-cancel:hover {
-            border-color: var(--foreground);
-        }
-
+        .btn-cancel:hover { background: #475569; }
         .btn-confirm-delete {
-            padding: 10px 18px;
-            border-radius: 0;
-            background: var(--sold-out);
+            padding: 8px 16px;
+            border-radius: 7px;
+            background: #ef4444;
             color: #ffffff;
-            border: 1px solid var(--sold-out);
-            font-family: var(--font-mono);
+            border: none;
             font-weight: 700;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
+            font-size: 0.84rem;
             cursor: pointer;
         }
-
-        .btn-confirm-delete:hover {
-            background: transparent;
-            color: var(--sold-out);
-        }
-
-        @media (max-width: 1180px) {
-            .hero-section { grid-template-columns: 1fr; }
-            .intel-grid { grid-template-columns: 1fr; }
-            .policy-grid { grid-template-columns: 1fr; }
-        }
-
-        @media (max-width: 860px) {
-            .nav-links { display: none; }
-            .kpi-matrix { grid-template-columns: repeat(2, 1fr); }
-            .add-account-form { grid-template-columns: 1fr; }
-            .container { padding: 24px 16px 60px; }
-            .navbar-inner { padding: 0 16px; }
-        }
+        .btn-confirm-delete:hover { background: #dc2626; }
     </style>
 </head>
 <body>
-
-<!-- EFFECT 2: ACID GREEN SCANLINE SWEEP -->
-<div class="scanline-sweep" aria-hidden="true"></div>
-
-<!-- 1. NAVBAR FIXED (68PX) -->
-<header class="navbar" id="topNavbar">
-    <div class="navbar-inner">
-        <a href="#" class="brand-logo">
-            <span class="brand-logo-title">SUBSTRATA</span>
-            <span class="brand-logo-tag">ANTI-DROP ENGINE V2</span>
-        </a>
-
-        <nav class="nav-links">
-            <a href="#roomsSection">01 // SALAS DE ALOCAÇÃO</a>
-            <a href="#lineupSection">02 // LINEUP ({{ accounts|length }})</a>
-            <a href="#bookingSection">03 // CONECTAR TOKEN</a>
-            <a href="#doorPolicySection">04 // REGRAS DE CADÊNCIA</a>
-        </nav>
-
-        <div class="nav-actions">
-            <button type="button" class="btn-square outline" onclick="copiarSnapshotVercel(this)" title="Copia o JSON completo com tokens + seguidores + views atuais">
-                💾 SNAPSHOT JSON
-            </button>
-            <button type="button" class="btn-square" onclick="atualizarMetricasContas(this)">
-                🔄 SINCRONIZAR AGORA
-            </button>
+<div class="container">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+        <div>
+            <h1>Painel de Monitoramento 24h & Inteligência Anti-Queda (v2)</h1>
+            <div class="hint">
+                🛡️ <b>Cadência Blindada (Padrão Vencedor):</b> Máximo de <b>2 lotes/24h</b> com intervalo de <b>3h30–4h</b> entre o 1º e o 2º lote, seguido de <b>descanso obrigatório de 12h–24h</b> e freio automático se a média de views do último lote cair.
+            </div>
         </div>
-    </div>
-</header>
-
-<!-- 2. NEXT EVENT / TELEMETRY BAR -->
-<div class="telemetry-strip">
-    <div class="telemetry-inner">
-        <div class="telemetry-group">
-            <span class="pulse-dot"></span>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             {% if upstash_active and redis_bootstrapped %}
-                <span style="color:var(--primary);">UPSTASH REDIS // SINCRONIZADO</span>
+            <div class="badge success" style="font-size:0.82rem; padding:8px 12px;">
+                ☁️ Banco Persistente: <b>Upstash Redis Sincronizado</b>
+            </div>
             {% elif upstash_active %}
-                <span style="color:var(--amber);">UPSTASH REDIS // AGUARDANDO CONEXÃO</span>
+            <div class="badge warning" style="font-size:0.82rem; padding:8px 12px;">
+                ⚠️ Upstash Configurado (Aguardando Conexão...)
+            </div>
             {% else %}
-                <span style="color:var(--amber);">STORAGE LOCAL // MODO /TMP ATIVO</span>
+            <div class="badge warning" style="font-size:0.82rem; padding:8px 12px;">
+                ⚠️ Upstash Redis Não Configurado (Usando /tmp)
+            </div>
             {% endif %}
-            <span style="color:var(--muted-foreground);">·</span>
-            <span>ÚLTIMA COLETA: <b style="color:var(--foreground);">{{ last_sync }}</b></span>
-            <span style="color:var(--muted-foreground);">·</span>
-            <span>API QUEUE: <code style="color:var(--primary);">/api/smart_queue</code></span>
-        </div>
-        <div class="telemetry-group">
-            <span>AUTO-RELOAD EM: <b id="reloadCountdown" style="color:var(--primary);">60s</b></span>
+            <div class="badge info" style="font-size:0.86rem; padding:8px 12px;">
+                🔄 Última Atualização: <b>{{ last_sync }}</b>
+            </div>
+            <div class="badge success" style="font-size:0.82rem; padding:8px 12px;">
+                ⏱️ Recarregando tela em: <span id="reloadCountdown">60s</span>
+            </div>
         </div>
     </div>
-</div>
 
-<main class="container">
-
-    <!-- 3. HERO & GLOBAL METRICS MATRIX -->
-    <section class="hero-section">
-        <div class="hero-copy">
-            <span class="eyebrow">MONITORAMENTO 24H · THREE ROOMS · CADÊNCIA BLINDADA · V2</span>
-            <h1 class="h1-display">SUBSTRATA</h1>
-            <p class="hint">
-                🛡️ <b>PROTOCOLO ANTI-QUEDA (PADRÃO VENCEDOR):</b> Máximo de <b>2 lotes/24h</b> com intervalo estrito de <b>3h30–4h</b> entre o 1º e o 2º lote, seguido de <b>descanso obrigatório de 12h–24h</b> e freio automático se a média real de views do último lote cair.
-            </p>
-        </div>
-
-        <div class="kpi-matrix">
-            <div class="kpi-cell">
-                <span class="kpi-label">01 // SEGUIDORES TOTAIS</span>
-                <span class="kpi-value acid">{{ total_followers | fmt_num }}</span>
-                <span class="sub-meta">{{ accounts|length }} CONTAS NO LINEUP</span>
-            </div>
-            <div class="kpi-cell">
-                <span class="kpi-label">02 // VISUALIZAÇÕES TOTAIS</span>
-                <span class="kpi-value cyan">{{ total_views | fmt_num }}</span>
-                <span class="sub-meta">SOMA GLOBAL ACUMULADA</span>
-            </div>
-            <div class="kpi-cell">
-                <span class="kpi-label">03 // TRAÇÃO POR MINUTO</span>
-                <span class="kpi-value amber">{{ total_views_per_min | fmt_rate }}/MIN</span>
-                <span class="sub-meta">VELOCIDADE ATUAL</span>
-            </div>
-            <div class="kpi-cell">
-                <span class="kpi-label">04 // TRAÇÃO POR HORA</span>
-                <span class="kpi-value">{{ total_views_per_hour | fmt_rate }}/H</span>
-                <span class="sub-meta">PROJEÇÃO 60 MINUTOS</span>
-            </div>
-            <div class="kpi-cell record-cell" title="Recorde de visualizações por minuto somando todas as contas simultaneamente">
-                <span class="kpi-label" style="color:var(--primary);">🏆 RECORDE GLOBAL (MIN)</span>
-                <span class="kpi-value acid">{{ global_peak_min_val | fmt_rate }}/M</span>
-                <span class="sub-meta">PICO SIMULTÂNEO</span>
-            </div>
-            <div class="kpi-cell record-cell" title="Recorde de visualizações por hora somando todas as contas simultaneamente">
-                <span class="kpi-label" style="color:var(--sold-out);">🏆 RECORDE GLOBAL (HORA)</span>
-                <span class="kpi-value magenta">{{ global_peak_hour_val | fmt_rate }}/H</span>
-                <span class="sub-meta">MÁXIMA HISTÓRICA</span>
-            </div>
-        </div>
-    </section>
-
-    <!-- 4. THE THREE ROOMS — CENTRAL TÁTICA DE ALOCAÇÃO DE LOTES -->
-    <section id="roomsSection" class="section-block">
-        <div class="section-header">
+    <!-- CENTRAL DE COMANDO E ALOCAÇÃO DE LOTES (MOTOR INTELIGENTE V2) -->
+    <div class="card" style="border-color:#3b82f6;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
             <div>
-                <span class="eyebrow">THE ROOMS // ALOCAÇÃO INTELIGENTE DE LOTES</span>
-                <h2 class="h2-display">CENTRAL TÁTICA (3H30 ENTRE LOTES + DESCANSO 12H–24H)</h2>
+                <h2 style="color:#60a5fa;">🧠 Central Tática de Alocação de Lotes (3h30 entre Lotes + Descanso 12h–24h)</h2>
                 <div class="hint">
                     Evita o erro de postar de 2h em 2h quando vídeos antigos estão viralizando: avalia a <b>média real do último lote</b>, <b>quantidade de lotes em 24h</b> e <b>tempo de descanso</b>.
                 </div>
             </div>
-            <span class="badge success">MOTOR INTELIGENTE ATIVO</span>
+            <span class="badge info">API Automação: <code>/api/smart_queue</code></span>
         </div>
 
         <div class="intel-grid">
-            <!-- ROOM 01: MAIN FLOOR (PRONTAS PARA LOTE AGORA) -->
-            <div class="intel-box room-ready">
-                <div class="room-header">
-                    <div>
-                        <span class="eyebrow">ROOM 01 // MAIN FLOOR</span>
-                        <h3 class="h3-display" style="color:var(--primary);">🔥 PRONTAS P/ LOTE AGORA</h3>
-                        <span class="sub-meta">JANELA 3H30+ OU 12H+ CUMPRIDA</span>
-                    </div>
-                    <span class="badge success">{{ ready_to_post_list|length if ready_to_post_list else 0 }} CONTAS</span>
-                </div>
-
-                <div class="room-list">
-                    {% if ready_to_post_list %}
-                        {% for item in ready_to_post_list %}
-                        <div class="intel-item">
-                            <div>
-                                <span class="intel-handle">@{{ item.username }}</span>
-                                <span class="sub-meta">{{ item.intel.action_title }} • ÚLTIMO {{ item.intel.last_post_age_str }} ({{ item.intel.batches_24h_count }}/2 LOTES 24H)</span>
-                            </div>
-                            <div style="text-align:right;">
-                                <span class="badge success">{{ item.views_per_min | fmt_rate }}/MIN</span>
-                                <span class="sub-meta">LOTE: <b style="color:var(--primary);">{{ item.intel.recommended_batch_size }} VÍDEOS</b></span>
-                            </div>
+            <!-- COLUNA 1: CONTAS PRONTAS PARA RECEBER LOTE AGORA -->
+            <div class="intel-box" style="border-color:rgba(34,197,94,0.4);">
+                <h3 style="color:#4ade80;">🔥 Prontas p/ Lote Agora (Janela 3h30+ ou 12h+ Cumprida)</h3>
+                {% if ready_to_post_list %}
+                    {% for item in ready_to_post_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">{{ item.intel.action_title }} • Último {{ item.intel.last_post_age_str }} ({{ item.intel.batches_24h_count }}/2 lotes 24h)</span>
                         </div>
-                        {% endfor %}
-                    {% else %}
-                        <div class="hint">Nenhuma conta livre para lote neste momento (todas cumprindo janela de 3h30 ou descanso de 12h–24h).</div>
-                    {% endif %}
-                </div>
+                        <div style="text-align:right;">
+                            <span class="badge success">{{ item.views_per_min | fmt_rate }}/min</span>
+                            <span class="sub-meta">Sugerido: <b>{{ item.intel.recommended_batch_size }} vídeos</b></span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Nenhuma conta livre para lote neste momento (todas cumprindo janela de 3h30 ou descanso de 12h–24h).</div>
+                {% endif %}
             </div>
 
-            <!-- ROOM 02: THE ANNEX (EM MATURAÇÃO OU DESCANSO) -->
-            <div class="intel-box room-cooldown">
-                <div class="room-header">
-                    <div>
-                        <span class="eyebrow" style="color:var(--amber);">ROOM 02 // THE ANNEX</span>
-                        <h3 class="h3-display" style="color:var(--amber);">⏳ MATURAÇÃO OU DESCANSO</h3>
-                        <span class="sub-meta">JANELA 3H30 OU CICLO 12H–24H</span>
-                    </div>
-                    <span class="badge warning">{{ maturing_cooldown_list|length if maturing_cooldown_list else 0 }} CONTAS</span>
-                </div>
-
-                <div class="room-list">
-                    {% if maturing_cooldown_list %}
-                        {% for item in maturing_cooldown_list %}
-                        <div class="intel-item">
-                            <div>
-                                <span class="intel-handle">@{{ item.username }}</span>
-                                <span class="sub-meta">
-                                    {{ item.intel.action_title }} • LOTE {{ item.intel.last_post_age_str }} (MÉDIA {{ item.intel.last_batch_avg_views | fmt_num }}/POST)
-                                </span>
-                            </div>
-                            <div style="text-align:right;">
-                                <span class="badge warning">{{ item.intel.batches_24h_count }}/2 LOTES</span>
-                                <span class="sub-meta" style="color:var(--amber);">{{ item.intel.posts_last_24h_count }} VÍDEOS EM 24H</span>
-                            </div>
+            <!-- COLUNA 2: CONTAS EM MATURAÇÃO (3H30) OU DESCANSO DE CICLO (12H-24H) -->
+            <div class="intel-box" style="border-color:rgba(245,158,11,0.4);">
+                <h3 style="color:#fbbf24;">⏳ Em Maturação (3h30) ou Descanso de Ciclo (12h–24h)</h3>
+                {% if maturing_cooldown_list %}
+                    {% for item in maturing_cooldown_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">
+                                {{ item.intel.action_title }} • Lote {{ item.intel.last_post_age_str }} (média {{ item.intel.last_batch_avg_views | fmt_num }} views/post)
+                            </span>
                         </div>
-                        {% endfor %}
-                    {% else %}
-                        <div class="hint">Nenhuma conta em janela de espera ou descanso de ciclo.</div>
-                    {% endif %}
-                </div>
+                        <div style="text-align:right;">
+                            <span class="badge warning">{{ item.intel.batches_24h_count }}/2 lotes (24h)</span>
+                            <span class="sub-meta" style="color:#fbbf24;">{{ item.intel.posts_last_24h_count }} vídeos em 24h</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Nenhuma conta em janela de espera ou descanso de ciclo.</div>
+                {% endif %}
             </div>
 
-            <!-- ROOM 03: BASEMENT (FREIO ANTI-QUEDA / ZUMBIS / RECONECTAR) -->
-            <div class="intel-box room-brake">
-                <div class="room-header">
-                    <div>
-                        <span class="eyebrow" style="color:var(--sold-out);">ROOM 03 // BASEMENT</span>
-                        <h3 class="h3-display" style="color:var(--sold-out);">🛑 FREIO ANTI-QUEDA / OFF</h3>
-                        <span class="sub-meta">THROTTLING, ZUMBIS OU RECONEXÃO</span>
-                    </div>
-                    <span class="badge error">{{ paused_or_down_list|length if paused_or_down_list else 0 }} CONTAS</span>
-                </div>
-
-                <div class="room-list">
-                    {% if paused_or_down_list %}
-                        {% for item in paused_or_down_list %}
-                        <div class="intel-item">
-                            <div>
-                                <span class="intel-handle">@{{ item.username }}</span>
-                                <span class="sub-meta">{{ item.intel.action_title }}</span>
-                            </div>
-                            <div style="text-align:right;">
-                                <span class="badge {{ item.intel.action_badge }}">{{ item.total_views | fmt_num }} VIEWS</span>
-                                <span class="sub-meta">ÚLT. LOTE: {{ item.intel.last_batch_avg_views | fmt_num }}/POST</span>
-                            </div>
+            <!-- COLUNA 3: FREIO ANTI-QUEDA / ZUMBIS / RECONECTAR -->
+            <div class="intel-box" style="border-color:rgba(239,68,68,0.4);">
+                <h3 style="color:#f87171;">🛑 Freio Anti-Queda, Zumbis ou Reconectar</h3>
+                {% if paused_or_down_list %}
+                    {% for item in paused_or_down_list %}
+                    <div class="intel-item">
+                        <div>
+                            <b>@{{ item.username }}</b>
+                            <span class="sub-meta">{{ item.intel.action_title }}</span>
                         </div>
-                        {% endfor %}
-                    {% else %}
-                        <div class="hint">Todas as contas estão saudáveis e sem sinais de throttling.</div>
-                    {% endif %}
-                </div>
+                        <div style="text-align:right;">
+                            <span class="badge {{ item.intel.action_badge }}">{{ item.total_views | fmt_num }} views</span>
+                            <span class="sub-meta">Último lote: {{ item.intel.last_batch_avg_views | fmt_num }}/post</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="hint">Todas as contas estão saudáveis e sem sinais de throttling.</div>
+                {% endif %}
             </div>
         </div>
-    </section>
+    </div>
 
-    <!-- 5. LINEUP — TABELA PRINCIPAL DE CONTAS CONECTADAS -->
-    <section id="lineupSection" class="section-block">
-        <div class="section-header">
+    <!-- TABELA PRINCIPAL DE CONTAS CONECTADAS -->
+    <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
             <div>
-                <span class="eyebrow">UPCOMING & ACTIVE // ROSTER COMPLETO</span>
-                <h2 class="h2-display" id="mainTableTitle">LINEUP DE CONTAS CONECTADAS ({{ accounts|length }})</h2>
-                <div class="hint">Clique em qualquer cabeçalho da tabela para reordenar em tempo real ↕ ou abra o diagnóstico individual de Reels.</div>
+                <h2 id="mainTableTitle">Contas Conectadas ({{ accounts|length }}) — Clique em qualquer coluna para ordenar ↕</h2>
+                <div class="top-stats-bar">
+                    <span>Seguidores Totais: <b style="color:#4ade80;">{{ total_followers | fmt_num }}</b></span>
+                    <span>Visualizações Totais: <b style="color:#38bdf8;">{{ total_views | fmt_num }}</b></span>
+                    <span>Views / Min Atuais: <b style="color:#fbbf24;">{{ total_views_per_min | fmt_rate }}/min</b></span>
+                    <span>Views / Hora Atuais: <b style="color:#c084fc;">{{ total_views_per_hour | fmt_rate }}/h</b></span>
+                    <span class="record-pill" title="Recorde de visualizações por minuto somando todas as contas simultaneamente">
+                        🏆 Recorde Min (Todas as Contas): <b style="color:#fbbf24;">{{ global_peak_min_val | fmt_rate }}/min</b>
+                    </span>
+                    <span class="record-pill" title="Recorde de visualizações por hora somando todas as contas simultaneamente">
+                        🏆 Recorde Hora (Todas as Contas): <b style="color:#f472b6;">{{ global_peak_hour_val | fmt_rate }}/h</b>
+                    </span>
+                </div>
             </div>
-            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-                <input type="text" id="accountSearchInput" class="search-filter-input" placeholder="FILTRAR @USERNAME OU STATUS..." oninput="filtrarContasNaTabela(this.value)">
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="small-btn secondary" onclick="copiarSnapshotVercel(this)" title="Copia o JSON completo com tokens + seguidores + views atuais">
+                    💾 Copiar Snapshot JSON
+                </button>
+                <button type="button" class="small-btn" onclick="atualizarMetricasContas(this)">
+                    🔄 Atualizar Seguidores, Visualizações e Posts
+                </button>
             </div>
         </div>
 
         {% if accounts %}
-        <div style="overflow-x:auto; margin-top:16px;">
+        <div style="overflow-x:auto;">
             <table id="accountsTable">
                 <thead>
                     <tr>
-                        <th class="sortable-th" data-col="0" data-type="number" onclick="ordenarTabelaPorColuna(0)" style="width:96px; text-align:center;" title="Clique para ordenar por quantidade de posts">
-                            RANK / REELS <span class="sort-arrow">↕</span>
+                        <th class="sortable-th" data-col="0" data-type="number" onclick="ordenarTabelaPorColuna(0)" style="width:92px; text-align:center;" title="Clique para ordenar por quantidade de posts">
+                            Rank / Posts <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="1" data-type="string" onclick="ordenarTabelaPorColuna(1)" title="Clique para ordenar por @Username">
-                            @USERNAME <span class="sort-arrow">↕</span>
+                            @Username <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="2" data-type="number" onclick="ordenarTabelaPorColuna(2)" title="Clique para ordenar por Status API e Cota 24h">
-                            STATUS & COTA 24H <span class="sort-arrow">↕</span>
+                            Status API & Cota 24h <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="3" data-type="number" onclick="ordenarTabelaPorColuna(3)" title="Clique para ordenar por Seguidores">
-                            SEGUIDORES & CONV. <span class="sort-arrow">↕</span>
+                            Seguidores & Conv. <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th active-sort" data-col="4" data-type="number" onclick="ordenarTabelaPorColuna(4)" title="Clique para ordenar por Visualizações Totais">
-                            VIEWS TOTAIS <span class="sort-arrow">▼</span>
+                            Visualizações Totais <span class="sort-arrow">▼</span>
                         </th>
                         <th class="sortable-th" data-col="5" data-type="number" onclick="ordenarTabelaPorColuna(5)" title="Clique para ordenar por Views / Min">
-                            VIEWS / MIN <span class="sort-arrow">↕</span>
+                            Views / Min (Atual) <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="6" data-type="number" onclick="ordenarTabelaPorColuna(6)" title="Clique para ordenar por Views / Hora">
-                            VIEWS / HORA <span class="sort-arrow">↕</span>
+                            Views / Hora (Atual) <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="7" data-type="number" onclick="ordenarTabelaPorColuna(7)" title="Clique para ordenar pelos Recordes da conta">
-                            🏆 RECORDES (M/H) <span class="sort-arrow">↕</span>
+                            🏆 Recordes (Min / Hora) <span class="sort-arrow">↕</span>
                         </th>
-                        <th class="sortable-th" data-col="8" data-type="number" onclick="ordenarTabelaPorColuna(8)" style="min-width:145px;" title="Clique para ordenar pelo Índice de Atividade (%)">
-                            ÍNDICE ATIVIDADE <span class="sort-arrow">↕</span>
+                        <th class="sortable-th" data-col="8" data-type="number" onclick="ordenarTabelaPorColuna(8)" style="min-width:135px;" title="Clique para ordenar pelo Índice de Atividade (%)">
+                            Índice Atividade & Ritmo <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="9" data-type="number" onclick="ordenarTabelaPorColuna(9)" title="Clique para ordenar pelo tempo desde o último lote">
-                            ÚLTIMO LOTE & 24H <span class="sort-arrow">↕</span>
+                            Último Lote & Fadiga 24h <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="10" data-type="number" onclick="ordenarTabelaPorColuna(10)" style="min-width:250px;" title="Clique para ordenar pela prioridade da Recomendação Anti-Queda">
-                            🧠 DIRETRIZ ANTI-QUEDA <span class="sort-arrow">↕</span>
+                            🧠 Recomendação Anti-Queda <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="11" data-type="number" onclick="ordenarTabelaPorColuna(11)" title="Clique para ordenar pela data/hora da Última Coleta">
-                            COLETA <span class="sort-arrow">↕</span>
+                            Última Coleta <span class="sort-arrow">↕</span>
                         </th>
                         <th class="sortable-th" data-col="12" data-type="string" onclick="ordenarTabelaPorColuna(12)" style="width:65px; text-align:center;" title="Clique para ordenar">
-                            DEL <span class="sort-arrow">↕</span>
+                            Excluir <span class="sort-arrow">↕</span>
                         </th>
                     </tr>
                 </thead>
@@ -3411,17 +2672,17 @@ HTML_TEMPLATE = r"""
                     {% set intel = acc.get('intel', {}) %}
                     {% set badge_status = acc.get('account_status_badge', 'success') %}
                     {% set status_rank = 3 if badge_status == 'success' else (2 if badge_status == 'warning' else 1) %}
-                    <tr id="acc_row_{{ acc_id }}" class="acc-main-row {% if badge_status == 'error' %}row-error{% endif %}" data-acc-id="{{ acc_id }}">
+                    <tr id="acc_row_{{ acc_id }}" class="acc-main-row" data-acc-id="{{ acc_id }}">
                         <td style="text-align:center; white-space:nowrap;" data-sort="{{ acc.get('media_count', 0) }}">
                             <div style="display:inline-flex; align-items:center; gap:6px;">
-                                <span class="badge info rank-badge-num" style="min-width:32px; justify-content:center;">#{{ loop.index }}</span>
+                                <span class="badge info rank-badge-num" style="min-width:30px; text-align:center;">#{{ loop.index }}</span>
                                 <button type="button" id="btn_toggle_{{ acc_id }}" class="posts-toggle-btn" onclick="togglePostsConta('{{ acc_id }}', this)" title="Abrir/fechar lista de posts e diagnóstico de retenção">
                                     ↓
                                 </button>
                             </div>
                         </td>
                         <td data-sort="{{ acc.username | lower }}">
-                            <span class="artist-handle">@{{ acc.username }}</span>
+                            <b>@{{ acc.username }}</b>
                             <span class="sub-meta">ID: {{ acc.ig_user_id }}</span>
                         </td>
                         <td data-sort="{{ status_rank * 1000 + (100 - intel.get('posts_last_24h_count', 0)) }}">
@@ -3433,51 +2694,51 @@ HTML_TEMPLATE = r"""
                         <td data-sort="{{ acc.get('followers_count', 0) }}">
                             <span class="metric-val">{{ acc.get('followers_count') | fmt_num }}</span>
                             <span class="sub-meta" title="Seguidores ganhos a cada 1.000 visualizações">
-                                🎯 {{ intel.get('followers_per_1k_views', 0) }} SEG / 1K
+                                🎯 {{ intel.get('followers_per_1k_views', 0) }} seg / 1k views
                             </span>
                         </td>
                         <td data-sort="{{ acc.get('total_views', 0) }}">
-                            <span class="metric-val" style="color:var(--primary);">{{ acc.get('total_views') | fmt_num }}</span>
+                            <span class="metric-val" style="color:#38bdf8;">{{ acc.get('total_views') | fmt_num }}</span>
                             <span class="sub-meta">
-                                {{ acc.get('media_count', 0) }} POSTS • 🏆 {{ intel.get('hits_10k', 0) }} HITS (+10K)
+                                {{ acc.get('media_count', 0) }} posts • 🏆 {{ intel.get('hits_10k', 0) }} hits (+10k)
                             </span>
                         </td>
                         <td data-sort="{{ acc.get('views_per_min', 0) }}">
-                            <span class="metric-val" style="color:var(--amber);">{{ acc.get('views_per_min', 0) | fmt_rate }}/MIN</span>
-                            <span class="sub-meta" style="color:{{ intel.get('trend_color', '#858585') }}; font-weight:700;">
+                            <span class="metric-val" style="color:#fbbf24;">{{ acc.get('views_per_min', 0) | fmt_rate }}/min</span>
+                            <span class="sub-meta" style="color:{{ intel.get('trend_color', '#94a3b8') }}; font-weight:600;">
                                 {{ intel.get('trend_label', '—') }}
                             </span>
                         </td>
                         <td data-sort="{{ acc.get('views_per_hour', 0) }}">
-                            <span class="metric-val" style="color:var(--cyan);">{{ acc.get('views_per_hour', 0) | fmt_rate }}/H</span>
+                            <span class="metric-val" style="color:#c084fc;">{{ acc.get('views_per_hour', 0) | fmt_rate }}/h</span>
                         </td>
                         <td data-sort="{{ acc.get('peak_views_per_min', 0) }}">
-                            <span class="mono-num" style="color:var(--primary); font-size:13px; display:block;">{{ acc.get('peak_views_per_min', 0) | fmt_rate }}/M</span>
-                            <span class="sub-meta" style="color:var(--sold-out); font-weight:700;">
-                                {{ acc.get('peak_views_per_hour', 0) | fmt_rate }}/H
+                            <span style="color:#fde047; font-weight:700;">{{ acc.get('peak_views_per_min', 0) | fmt_rate }}/m</span>
+                            <span class="sub-meta" style="color:#f472b6; font-weight:600;">
+                                {{ acc.get('peak_views_per_hour', 0) | fmt_rate }}/h
                             </span>
                         </td>
                         <td data-sort="{{ intel.get('activity_index_pct', 0) }}">
-                            <div style="display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:11px;">
-                                <span>SAÚDE:</span>
-                                <b style="color:var(--foreground);">{{ intel.get('activity_index_pct', 0) }}%</b>
+                            <div style="display:flex; justify-content:space-between; font-size:0.78rem;">
+                                <span>Saúde vs Pico:</span>
+                                <b style="color:#f8fafc;">{{ intel.get('activity_index_pct', 0) }}%</b>
                             </div>
                             <div class="progress-bar-bg">
-                                <div class="progress-bar-fill" style="width:{{ intel.get('activity_index_pct', 0) }}%; background:{% if intel.get('activity_index_pct', 0) >= 60 %}var(--primary){% elif intel.get('activity_index_pct', 0) >= 20 %}var(--cyan){% else %}var(--sold-out){% endif %};"></div>
+                                <div class="progress-bar-fill" style="width:{{ intel.get('activity_index_pct', 0) }}%; background:{% if intel.get('activity_index_pct', 0) >= 60 %}#22c55e{% elif intel.get('activity_index_pct', 0) >= 20 %}#38bdf8{% else %}#ef4444{% endif %};"></div>
                             </div>
                             <span class="sub-meta">
-                                TOP 1 = {{ intel.get('top_post_share_pct', 0) }}% DAS VIEWS
+                                Top 1 post = {{ intel.get('top_post_share_pct', 0) }}% das views
                             </span>
                         </td>
                         <td data-sort="{{ intel.get('mins_since_last_post') if intel.get('mins_since_last_post') is not none else 9999999 }}">
-                            <b class="mono-num" style="color:var(--foreground); font-size:12px;">ÚLT: {{ intel.get('last_post_age_str', '—') }}</b>
-                            <span class="sub-meta" style="color:{% if intel.get('batches_24h_count', 0) >= 2 %}var(--amber){% else %}var(--primary){% endif %}; font-weight:700;">
-                                📦 24H: {{ intel.get('batches_24h_count', 0) }}/2 LOTES ({{ intel.get('posts_last_24h_count', 0) }} VÍD)
+                            <b style="color:#e2e8f0; font-size:0.81rem;">Último: {{ intel.get('last_post_age_str', '—') }}</b>
+                            <span class="sub-meta" style="color:{% if intel.get('batches_24h_count', 0) >= 2 %}#fbbf24{% else %}#4ade80{% endif %}; font-weight:600;">
+                                📦 24h: {{ intel.get('batches_24h_count', 0) }}/2 lotes ({{ intel.get('posts_last_24h_count', 0) }} vídeos)
                             </span>
-                            <span class="sub-meta" style="color:var(--foreground);">
-                                MÉDIA LOTE: <b>{{ intel.get('last_batch_avg_views', 0) | fmt_num }}</b>/POST
+                            <span class="sub-meta" style="color:#cbd5e1;">
+                                Média últ. lote: <b>{{ intel.get('last_batch_avg_views', 0) | fmt_num }}</b> views/post
                             </span>
-                            <span class="sub-meta" style="color:var(--cyan);">
+                            <span class="sub-meta" style="color:#38bdf8;">
                                 ⏰ {{ intel.get('best_window_str', '—') }}
                             </span>
                         </td>
@@ -3485,43 +2746,43 @@ HTML_TEMPLATE = r"""
                             <span class="badge {{ intel.get('action_badge', 'info') }}">
                                 {{ intel.get('action_title', '—') }}
                             </span>
-                            <span class="sub-meta" style="max-width:275px; white-space:normal; line-height:1.35;">
+                            <span class="sub-meta" style="max-width:275px; white-space:normal; line-height:1.3;">
                                 {{ intel.get('action_detail', '') }}
                             </span>
                         </td>
                         <td data-sort="{{ acc.get('updated_at_ts', 0) }}">
-                            <span class="mono-num" style="font-size:11px; color:var(--muted-foreground);">{{ acc.get('metrics_updated_at', '—') }}</span>
+                            <span style="font-size:0.8rem;">{{ acc.get('metrics_updated_at', '—') }}</span>
                         </td>
                         <td style="text-align:center;" data-sort="{{ acc.username | lower }}">
                             <button type="button" class="delete-acc-btn" onclick="abrirModalExclusao('{{ acc_id }}', '{{ acc.username }}')" title="Remover @{{ acc.username }} do painel">
-                                ✕
+                                🗑️
                             </button>
                         </td>
                     </tr>
                     <tr id="posts_row_{{ acc_id }}" class="posts-dropdown-row" style="display:none;">
-                        <td colspan="13" style="padding:12px 18px;">
+                        <td colspan="13" style="padding:10px 16px;">
                             <div class="posts-dropdown-box">
-                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px; border-bottom:1px solid var(--border); padding-bottom:10px;">
-                                    <b class="mono-num" style="color:var(--primary); font-size:12px;">
-                                        📊 TRACKLIST DE REELS // @{{ acc.username }} — TRAÇÃO, DURAÇÃO E HORÁRIO REAL (BRT)
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+                                    <b style="color:#38bdf8; font-size:0.88rem;">
+                                        📊 Posts / Reels de @{{ acc.username }} — Diagnóstico de Tração, Duração do Vídeo e Horário Real (BRT)
                                     </b>
-                                    <span class="mono-num" style="color:var(--muted-foreground); font-size:11px;">
-                                        TOTAL: {{ posts_ordenados|length }} POST(S) |
-                                        🏆 HITS +10K: <b style="color:var(--primary);">{{ intel.get('hits_10k', 0) }} ({{ intel.get('hit_rate_10k_pct', 0) }}%)</b> |
-                                        💀 MORTE SÚBITA (&lt;400 VIEWS APÓS 2H): <b style="color:var(--sold-out);">{{ intel.get('dead_posts_count', 0) }}</b>
+                                    <span style="color:var(--muted); font-size:0.78rem;">
+                                        Total: {{ posts_ordenados|length }} post(s) |
+                                        🏆 Hits +10k: <b>{{ intel.get('hits_10k', 0) }} ({{ intel.get('hit_rate_10k_pct', 0) }}%)</b> |
+                                        💀 Morte Súbita (&lt;400 views após 2h): <b>{{ intel.get('dead_posts_count', 0) }}</b>
                                     </span>
                                 </div>
                                 {% if posts_ordenados %}
                                     {% for p in posts_ordenados %}
                                     <div class="post-rank-item">
-                                        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-                                            <span class="badge info" style="min-width:36px; justify-content:center;">#{{ loop.index }}</span>
-                                            <span style="font-weight:700; color:var(--primary); min-width:125px;">
-                                                👁️ {{ p.get('views', 0) | fmt_num }} VIEWS
+                                        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                                            <span class="badge info" style="min-width:34px; text-align:center;">#{{ loop.index }}</span>
+                                            <span style="font-weight:700; color:#4ade80; min-width:120px;">
+                                                👁️ {{ p.get('views', 0) | fmt_num }} views
                                             </span>
                                             {% if p.get('recent_views_gain', 0) > 0 %}
                                             <span class="badge success" title="Visualizações ganhas desde a última sincronização">
-                                                +{{ p.get('recent_views_gain') | fmt_num }} AGORA
+                                                +{{ p.get('recent_views_gain') | fmt_num }} agora
                                             </span>
                                             {% endif %}
                                             <span class="badge {{ p.get('diag_badge', 'info') }}">
@@ -3534,16 +2795,16 @@ HTML_TEMPLATE = r"""
                                                 ⏱️ {{ p.get('duration_sec', 0) | fmt_dur }}
                                             </span>
                                         </div>
-                                        <div style="color:var(--muted-foreground); font-size:11px; text-align:right; white-space:nowrap;">
-                                            <span>⏳ IDADE: <b style="color:var(--foreground);">{{ p.get('age_human', '—') }}</b></span>
+                                        <div style="color:var(--muted); font-size:0.78rem; text-align:right; white-space:nowrap;">
+                                            <span>⏳ Idade: <b style="color:#e2e8f0;">{{ p.get('age_human', '—') }}</b></span>
                                             {% if p.get('timestamp_brt') %}
-                                            <span style="margin-left:8px;">(📅 {{ p.get('timestamp_brt') }} BRT)</span>
+                                            <span style="margin-left:8px; color:#94a3b8;">(📅 {{ p.get('timestamp_brt') }} BRT)</span>
                                             {% endif %}
                                         </div>
                                     </div>
                                     {% endfor %}
                                 {% else %}
-                                    <div class="hint" style="margin:0; color:var(--amber);">
+                                    <div class="hint" style="margin:0; color:#fbbf24;">
                                         Nenhum post carregado ainda ou esta conta caiu antes da primeira sincronização de posts.
                                     </div>
                                 {% endif %}
@@ -3555,91 +2816,54 @@ HTML_TEMPLATE = r"""
             </table>
         </div>
         {% else %}
-        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada ainda. Adicione sua primeira conta no terminal de conexão abaixo.</p>
+        <p class="hint" style="margin-top:16px;">Nenhuma conta configurada ainda. Adicione sua primeira conta no painel abaixo.</p>
         {% endif %}
-    </section>
+    </div>
 
-    <!-- 6. TABLES & BOOKING — ADICIONAR OU RECONECTAR CONTA -->
-    <section id="bookingSection" class="section-block" style="border-color:var(--primary-border);">
-        <div class="section-header">
+    <!-- SEÇÃO NO FINAL DA PÁGINA: ADICIONAR OU RECONECTAR CONTA COM 1 OU 2 DADOS -->
+    <div class="card" style="border-color:rgba(34, 197, 94, 0.45);">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
             <div>
-                <span class="eyebrow">TABLE BOOKING & ACCESS // CONEXÃO GRAPH API</span>
-                <h2 class="h2-display">ADICIONAR OU RECONECTAR CONTA RÁPIDO</h2>
+                <h2 style="color:#4ade80; font-size:1.1rem;">➕ Adicionar ou Reconectar Conta Rápido</h2>
                 <div class="hint">
-                    Basta colar o <b>Access Token</b> (o sistema descobre o ID, @username, seguidores e vídeos sozinho). Se quiser, informe também o <b>ID da Conta</b> opcionalmente.
+                    Basta colar o <b>Access Token</b> (o sistema descobre o ID, @username, seguidores e vídeos sozinho). Se quiser, você também pode informar o <b>ID da Conta</b> opcionalmente.
                 </div>
             </div>
-            <span class="badge success">PERSISTÊNCIA AUTOMÁTICA UPSTASH + JSON</span>
+            <span class="badge success">Persistência Automática Upstash + JSON</span>
         </div>
 
         <form class="add-account-form" onsubmit="adicionarNovaConta(event)">
             <div class="field-group">
-                <label for="newAccToken">🔑 ACCESS TOKEN DA CONTA (IGAA... OU EAA...)</label>
+                <label for="newAccToken">🔑 Access Token da Conta (IGAA... ou EAA...)</label>
                 <input type="text" id="newAccToken" class="input-dark" placeholder="Cole aqui o Access Token da conta..." autocomplete="off">
             </div>
             <div class="field-group">
-                <label for="newAccId">🆔 ID DA CONTA (OPCIONAL — DESCOBERTO PELO TOKEN)</label>
+                <label for="newAccId">🆔 ID da Conta (Opcional — descoberto pelo Token)</label>
                 <input type="text" id="newAccId" class="input-dark" placeholder="Ex: 17841400000000000 (opcional)" autocomplete="off">
             </div>
             <div>
                 <button type="submit" id="btnAddAccount" class="btn-add-acc">
-                    ➕ CONECTAR E SINCRONIZAR
+                    ➕ Conectar e Sincronizar
                 </button>
             </div>
         </form>
-        <div id="addAccountStatus" class="mono-num" style="margin-top:14px; font-size:12px; display:none;"></div>
-    </section>
-
-    <!-- 7. DOOR POLICY — REGRAS DE CADÊNCIA BLINDADA -->
-    <section id="doorPolicySection" class="section-block">
-        <div class="section-header">
-            <div>
-                <span class="eyebrow">DOOR POLICY // READ THIS BEFORE YOU POST</span>
-                <h2 class="h2-display">REGRAS DE OPERAÇÃO & ANTI-SHADOWBAN</h2>
-            </div>
-            <span class="badge info">PROTOCOLO NÃO-NEGOCIÁVEL</span>
-        </div>
-
-        <div class="policy-grid">
-            <div class="policy-card">
-                <h4>01 // JANELA DE MATURAÇÃO (3H30–4H)</h4>
-                <p>Nunca dispare lotes de 2h em 2h. O algoritmo exige no mínimo 3h30 a 4h entre o 1º e o 2º lote do dia para indexar a retenção sem canibalizar a entrega dos vídeos anteriores.</p>
-            </div>
-            <div class="policy-card">
-                <h4>02 // DESCANSO DE CICLO (12H–24H)</h4>
-                <p>Após fechar 2 lotes dentro da janela de 24 horas, a conta entra em repouso obrigatório de 12h a 24h. Forçar um 3º lote derruba o alcance orgânico imediato.</p>
-            </div>
-            <div class="policy-card">
-                <h4>03 // FREIO AUTOMÁTICO DE QUEDA</h4>
-                <p>Se a média de views por vídeo do último lote cair drasticamente em relação ao histórico da conta, o motor bloqueia novos envios até que a tração estabilize.</p>
-            </div>
-        </div>
-    </section>
-
-</main>
-
-<!-- FOOTER -->
-<footer class="substrata-footer">
-    <div class="substrata-footer-inner">
-        <div>SUBSTRATA · NIGHTCLUB TELEMETRY SYSTEM · THREE ROOMS · 24/7</div>
-        <div>UPSTASH REDIS + META GRAPH API · © 2026</div>
+        <div id="addAccountStatus" class="hint" style="margin-top:10px; display:none; font-weight:600;"></div>
     </div>
-</footer>
+</div>
 
 <!-- POP-UP MODAL DE CONFIRMAÇÃO DE EXCLUSÃO DE CONTA -->
 <div id="deleteModalOverlay" class="modal-overlay" onclick="fecharModalSeClicarFora(event)">
     <div class="modal-card">
-        <span class="eyebrow" style="color:var(--sold-out);">REMOÇÃO PERMANENTE</span>
         <div class="modal-title">
-            CONFIRMAR EXCLUSÃO DA CONTA
+            🗑️ Confirmar Exclusão da Conta
         </div>
         <div class="modal-body">
-            Tem certeza que deseja remover a conta <b id="modalDeleteUsername" style="color:var(--primary);">@conta</b> (ID: <code id="modalDeleteAccId" style="color:var(--muted-foreground);">—</code>) deste painel?<br><br>
-            <span style="color:var(--amber); font-family:var(--font-mono); font-size:12px;">⚠️ A CONTA SERÁ REMOVIDA IMEDIATAMENTE DA VISUALIZAÇÃO E DO UPSTASH REDIS.</span>
+            Tem certeza que deseja remover a conta <b id="modalDeleteUsername" style="color:#f8fafc;">@conta</b> (ID: <code id="modalDeleteAccId">—</code>) deste painel?<br><br>
+            <span style="color:#fbbf24; font-size:0.81rem;">⚠️ A conta será removida imediatamente da visualização e do banco persistente (Upstash Redis).</span>
         </div>
         <div class="modal-actions">
-            <button type="button" class="btn-cancel" onclick="fecharModalExclusao()">CANCELAR</button>
-            <button type="button" id="btnConfirmDeleteAcc" class="btn-confirm-delete" onclick="confirmarExclusaoConta()">SIM, EXCLUIR CONTA</button>
+            <button type="button" class="btn-cancel" onclick="fecharModalExclusao()">Cancelar</button>
+            <button type="button" id="btnConfirmDeleteAcc" class="btn-confirm-delete" onclick="confirmarExclusaoConta()">Sim, Excluir Conta</button>
         </div>
     </div>
 </div>
@@ -3648,37 +2872,6 @@ HTML_TEMPLATE = r"""
     let contaPendenteExclusaoId = null;
     let contaPendenteExclusaoUser = null;
     let adicionandoContaEmAndamento = false;
-
-    // Acid green bottom border on navbar after scroll
-    window.addEventListener('scroll', () => {
-        const nav = document.getElementById('topNavbar');
-        if (!nav) return;
-        if (window.scrollY > 16) {
-            nav.classList.add('scrolled');
-        } else {
-            nav.classList.remove('scrolled');
-        }
-    });
-
-    // Filtro rápido por @username ou texto na linha
-    function filtrarContasNaTabela(query) {
-        const termo = (query || '').trim().toLowerCase();
-        const tbody = document.getElementById('accountsTableBody');
-        if (!tbody) return;
-
-        const mainRows = tbody.querySelectorAll('tr.acc-main-row');
-        mainRows.forEach(row => {
-            const accId = row.getAttribute('data-acc-id');
-            const detailRow = document.getElementById('posts_row_' + accId);
-            const textoLinha = row.innerText.toLowerCase();
-            const visivel = !termo || textoLinha.includes(termo);
-
-            row.style.display = visivel ? '' : 'none';
-            if (!visivel && detailRow) {
-                detailRow.style.display = 'none';
-            }
-        });
-    }
 
     // Estado de ordenação atual (padrão: coluna 4 = Visualizações Totais, decrescente)
     let currentSortCol = 4;
@@ -3701,6 +2894,8 @@ HTML_TEMPLATE = r"""
                 currentSortDir = (currentSortDir === 'desc') ? 'asc' : 'desc';
             } else {
                 currentSortCol = colIndex;
+                // Para texto (@Username), o 1º clique pode começar crescente (A->Z) ou decrescente;
+                // para números, começa decrescente (maior -> menor), e alterna a cada clique.
                 const sortType = targetHeader.getAttribute('data-type') || 'number';
                 currentSortDir = (sortType === 'string') ? 'asc' : 'desc';
             }
@@ -3770,7 +2965,7 @@ HTML_TEMPLATE = r"""
         document.getElementById('modalDeleteAccId').innerText = accId;
         const btn = document.getElementById('btnConfirmDeleteAcc');
         btn.disabled = false;
-        btn.innerText = 'SIM, EXCLUIR CONTA';
+        btn.innerText = 'Sim, Excluir Conta';
         document.getElementById('deleteModalOverlay').style.display = 'flex';
     }
 
@@ -3790,7 +2985,7 @@ HTML_TEMPLATE = r"""
         if (!contaPendenteExclusaoId) return;
         const btn = document.getElementById('btnConfirmDeleteAcc');
         btn.disabled = true;
-        btn.innerText = '⏳ EXCLUINDO...';
+        btn.innerText = '⏳ Excluindo...';
 
         try {
             const res = await fetch('/api/delete_account/' + encodeURIComponent(contaPendenteExclusaoId), {
@@ -3807,12 +3002,12 @@ HTML_TEMPLATE = r"""
             } else {
                 alert('Erro ao excluir conta: ' + (data.error || 'Falha desconhecida'));
                 btn.disabled = false;
-                btn.innerText = 'SIM, EXCLUIR CONTA';
+                btn.innerText = 'Sim, Excluir Conta';
             }
         } catch (e) {
             alert('Erro de rede ao tentar excluir conta: ' + e);
             btn.disabled = false;
-            btn.innerText = 'SIM, EXCLUIR CONTA';
+            btn.innerText = 'Sim, Excluir Conta';
         }
     }
 
@@ -3828,17 +3023,17 @@ HTML_TEMPLATE = r"""
 
         if (!accessToken && !igUserId) {
             statusEl.style.display = 'block';
-            statusEl.style.color = 'var(--sold-out)';
-            statusEl.innerText = '⚠️ INFORME PELO MENOS O ACCESS TOKEN OU O ID DA CONTA.';
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = '⚠️ Informe pelo menos o Access Token ou o ID da conta.';
             return;
         }
 
         adicionandoContaEmAndamento = true;
         btn.disabled = true;
-        btn.innerText = '⏳ BUSCANDO NA META...';
+        btn.innerText = '⏳ Buscando dados na Meta e salvando...';
         statusEl.style.display = 'block';
-        statusEl.style.color = 'var(--cyan)';
-        statusEl.innerText = '🔄 CONECTANDO À GRAPH API DO INSTAGRAM, COLETANDO SEGUIDORES, REELS E VISUALIZAÇÕES...';
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = '🔄 Conectando à Graph API do Instagram, coletando seguidores, Reels e visualizações...';
 
         try {
             const res = await fetch('/api/add_account', {
@@ -3851,23 +3046,23 @@ HTML_TEMPLATE = r"""
             });
             const data = await res.json();
             if (res.ok && data.ok) {
-                statusEl.style.color = 'var(--primary)';
-                statusEl.innerText = '✅ CONTA @' + (data.username || data.ig_user_id) + ' ADICIONADA COM SUCESSO! RECARREGANDO PAINEL...';
+                statusEl.style.color = '#4ade80';
+                statusEl.innerText = '✅ Conta @' + (data.username || data.ig_user_id) + ' adicionada com sucesso! Recarregando painel...';
                 tokenEl.value = '';
                 idEl.value = '';
                 setTimeout(() => window.location.reload(), 700);
             } else {
-                statusEl.style.color = 'var(--sold-out)';
-                statusEl.innerText = '❌ ERRO: ' + (data.error || 'NÃO FOI POSSÍVEL ADICIONAR A CONTA.');
+                statusEl.style.color = '#f87171';
+                statusEl.innerText = '❌ Erro: ' + (data.error || 'Não foi possível adicionar a conta.');
                 btn.disabled = false;
-                btn.innerText = '➕ CONECTAR E SINCRONIZAR';
+                btn.innerText = '➕ Conectar e Sincronizar';
                 adicionandoContaEmAndamento = false;
             }
         } catch (e) {
-            statusEl.style.color = 'var(--sold-out)';
-            statusEl.innerText = '❌ ERRO DE REDE AO ADICIONAR CONTA: ' + e;
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = '❌ Erro de rede ao adicionar conta: ' + e;
             btn.disabled = false;
-            btn.innerText = '➕ CONECTAR E SINCRONIZAR';
+            btn.innerText = '➕ Conectar e Sincronizar';
             adicionandoContaEmAndamento = false;
         }
     }
@@ -3889,14 +3084,14 @@ HTML_TEMPLATE = r"""
 
     function atualizarMetricasContas(btn) {
         btn.disabled = true;
-        btn.innerText = '⏳ SINCRONIZANDO UPSTASH...';
+        btn.innerText = '⏳ Atualizando métricas e salvando no Upstash...';
         window.location.href = '/atualizar_metricas';
     }
 
     async function copiarSnapshotVercel(btn) {
         const origText = btn.innerText;
         btn.disabled = true;
-        btn.innerText = '⏳ GERANDO JSON...';
+        btn.innerText = '⏳ Gerando JSON...';
         try {
             const res = await fetch('/api/export_snapshot');
             const data = await res.json();
@@ -3937,9 +3132,9 @@ HTML_TEMPLATE = r"""
         if (modal && modal.style.display === 'flex') return;
         if (adicionandoContaEmAndamento) return;
 
-        // Pausa o reload automático se o usuário estiver digitando no formulário ou na busca
+        // Pausa o reload automático se o usuário estiver digitando no formulário lá embaixo
         const activeEl = document.activeElement;
-        if (activeEl && (activeEl.id === 'newAccToken' || activeEl.id === 'newAccId' || activeEl.id === 'accountSearchInput')) return;
+        if (activeEl && (activeEl.id === 'newAccToken' || activeEl.id === 'newAccId')) return;
 
         remaining--;
         const el = document.getElementById('reloadCountdown');
